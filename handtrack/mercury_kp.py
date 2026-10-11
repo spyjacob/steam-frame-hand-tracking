@@ -154,12 +154,12 @@ class MercuryKeypoint:
         f += 0.5 - f.mean()
         return f
 
-    def run(self, slot, det_img, joints_cv, flip, use_hint=True):
+    def run(self, slot, det_img, joints_cv, flip, use_hint=True, expand=None):
         """joints_cv: (21,3) predicted joints in this camera's OpenCV frame (metres).
         Returns dict: rays (21,3) unit directions in the OpenCV camera frame, det_px (21,2),
         conf (21,) heatmap peak values, rel_depth (21,), is_hand prob, curls (5,), curl_var (5,)."""
         jm = joints_cv * np.array([1, -1, -1])
-        q, r, kp, _ = make_instructions(jm, flip)
+        q, r, kp, _ = make_instructions(jm, flip, expand=EXPAND if expand is None else expand)
         img = self.crop(slot, det_img, q, r, flip)
         x = self.normalise(img)
         if x is None:

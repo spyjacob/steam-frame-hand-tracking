@@ -16,6 +16,10 @@ fi
 if ! kill -0 "$(cat $R/live.pid 2>/dev/null)" 2>/dev/null; then
   nohup chrt --idle 0 ../venv/bin/python -m handtrack.live --no-http $ARGS > /tmp/live.log 2>&1 &
   echo $! > $R/live.pid
+elif [ -n "$*" ]; then
+  # a tracker is already running (e.g. started from the dashboard panel): these args are NOT applied
+  echo "WARNING: tracker already running (pid $(cat $R/live.pid)); args NOT applied: $* -- run stop.sh first" >&2
+  ARGS="(already running, args not applied)"
 fi
 if ! kill -0 "$(cat $R/watchdog.pid 2>/dev/null)" 2>/dev/null; then
   nohup ../venv/bin/python -m handtrack.watchdog > /tmp/watchdog.log 2>&1 &

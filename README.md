@@ -24,7 +24,7 @@ back on the controller.**
 - Runs on the Frame itself; camera images never leave the headset, only hand poses (~150 bytes,
   60 times a second) go to the PC.
 - Works with Valve's normal Frame streaming. Any app with Frame-controller bindings works.
-- Status, measurements and limitations: **[REPORT.md](REPORT.md)**.
+- Status, measurements and limitations: **[REPORT.md](REPORT.md)**; latest latency work: [LATENCY_REPORT_V2.md](LATENCY_REPORT_V2.md); next research: [RESEARCH_BRIEF_V3.md](RESEARCH_BRIEF_V3.md).
 
 ## The panel
 
@@ -60,6 +60,13 @@ How loose the set-down / pick-up rules are is in `pcdriver/framehands/framehands
 | `stillCm`, `stillDeg` | 2 cm, 6° | how still "still" is |
 | `handAwayCm` | 10 cm | your tracked palm must be at least this far from the controller (a controller held still in your hand never switches) |
 | `pickupCm`, `pickupDeg` | 4 cm, 15° | moving the controller this much returns to the controller |
+
+### Smoothing
+
+The wrist/finger smoothing can be changed live with `~/.config/mrhand/profile` (no restart; delete the
+file to return to the default). The default favours smooth slow movement with less lag than before.
+For the previous, smoothest setting: `cp ~/handtrack/src/tools/profile_smooth_v1.conf ~/.config/mrhand/profile`.
+Keys and measurements: [LATENCY_REPORT_V2.md](LATENCY_REPORT_V2.md).
 
 ## Troubleshooting
 

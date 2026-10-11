@@ -64,18 +64,33 @@ def init_mercury_proc():
     init_mercury()
 
 
+def _schedstat():
+    """(on-CPU ns, runqueue-wait ns) of the calling thread, or (0, 0) if unavailable."""
+    try:
+        with open("/proc/thread-self/schedstat") as f:
+            c, w = f.read().split()[:2]
+        return int(c), int(w)
+    except (OSError, ValueError):
+        return 0, 0
+
+
 def run_mercury(jobs, imgs):
     """jobs: [(slot, side, joints_cv (21,3))]; ROI from those joints, same images MediaPipe saw.
-    Returns [(slot, side, result-without-crop or None, seconds)]."""
+    Returns [(slot, side, result-without-crop or None, seconds, timing)] where timing =
+    {t0, t1: CLOCK_MONOTONIC ns around this crop (same clock as the tracker), cpu_ns: thread CPU
+    time, wait_ns: runqueue wait (schedstat) during the crop}."""
     import time
     mk = init_mercury()
     out = []
-    for slot, side, jc in jobs:
-        td = time.perf_counter()
-        r = mk.run(slot, imgs[slot], jc, flip=(side == "right"))
+    for job in jobs:
+        slot, side, jc = job[:3]
+        expand = job[3] if len(job) > 3 else None
+        s0, t0, td = _schedstat(), time.monotonic_ns(), time.perf_counter()
+        r = mk.run(slot, imgs[slot], jc, flip=(side == "right"), expand=expand)
+        dsec, t1, s1 = time.perf_counter() - td, time.monotonic_ns(), _schedstat()
         if r is not None:
             r.pop("crop", None)
-        out.append((slot, side, r, time.perf_counter() - td))
+        out.append((slot, side, r, dsec, {"t0": t0, "t1": t1, "cpu_ns": s1[0] - s0[0], "wait_ns": s1[1] - s0[1]}))
     return out
 
 

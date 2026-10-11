@@ -58,6 +58,66 @@ SHM = "/dev/shm/mrhand-pt"
 HANDS_FILE = os.path.expanduser("~/.config/mrhand/hands")
 
 
+PROFILE_FILE = os.path.expanduser("~/.config/mrhand/profile")
+# Latency/smoothing profile, editable live (re-read about once a second).  Missing file or missing key =
+# the current smooth defaults below, so deleting the file is an instant rollback.
+#   axis_filter   = <min_cutoff> <beta> | off   palm orientation axes One Euro (palm.py)
+#   centre_filter = <min_cutoff> <beta> | off   palm centre One Euro inside the pose (palm.py)
+#   curl_filter   = <min_cutoff> <beta> | off   finger curls One Euro
+#   pos_filter    = <min_cutoff> <beta> | off   sent position One Euro (fast path)
+#   rot_glide_ms  = <ms>  (0 = off)             exponential glide toward the newest orientation
+# Default = "A" from the 2026-10-11 latency pass: smoother than before when the hand is still, faster when
+# it moves (orientation lag ~130 vs ~160 ms, same still-hand jitter).  The previous smooth profile is
+# tools/profile_smooth_v1.conf (copy it to ~/.config/mrhand/profile to go back).
+PROFILE_DEFAULTS = {"axis_filter": (0.4, 1.2), "centre_filter": (1.5, 0.6), "curl_filter": (1.0, 1.0),
+                    "pos_filter": (1.2, 1.5), "rot_glide_ms": 25.0}
+
+
+class Profile:
+    def __init__(self, path=PROFILE_FILE):
+        self.path, self.mtime, self.next = path, None, 0.0
+        self.values = dict(PROFILE_DEFAULTS)
+
+    def _parse(self, text):
+        v = dict(PROFILE_DEFAULTS)
+        for line in text.splitlines():
+            line = line.split("#", 1)[0].strip()
+            if "=" not in line:
+                continue
+            k, val = (s.strip() for s in line.split("=", 1))
+            if k not in v:
+                continue
+            if k == "rot_glide_ms":
+                v[k] = float(val)
+            elif val == "off":
+                v[k] = None
+            else:
+                a, b = val.split()[:2]
+                v[k] = (float(a), float(b))
+        return v
+
+    def poll(self):
+        """Returns the new values dict when the file changed, else None."""
+        now = time.monotonic()
+        if now < self.next:
+            return None
+        self.next = now + 1.0
+        try:
+            mt = os.stat(self.path).st_mtime
+        except OSError:
+            mt = None
+        if mt == self.mtime:
+            return None
+        self.mtime = mt
+        try:
+            self.values = self._parse(open(self.path).read()) if mt is not None else dict(PROFILE_DEFAULTS)
+        except (OSError, ValueError) as e:
+            print("profile: ignoring %s (%r)" % (self.path, e), file=sys.stderr, flush=True)
+            return None
+        print("profile: %s" % " ".join("%s=%s" % kv for kv in sorted(self.values.items())), file=sys.stderr, flush=True)
+        return self.values
+
+
 class EnabledHands:
     def __init__(self, path=HANDS_FILE):
         self.path, self.mtime, self.sides, self.next = path, None, {"left", "right"}, 0.0
@@ -253,6 +313,17 @@ def main():
     ap.add_argument("--curl-source", choices=("mercury", "geometric"), default="mercury",
                     help="finger curls from Mercury's curl output (default) or from the 3D joint angles")
     ap.add_argument("--merc-hz", type=float, default=30.0, help="Mercury tracking cycles per second (one crop per hand)")
+    ap.add_argument("--max-speed", type=float, default=4.0,
+                    help="fast tracker: apparent palm speed (m/s) above which a track is treated as an error")
+    ap.add_argument("--lk-levels", type=int, default=3, help="fast tracker: optical-flow pyramid levels")
+    ap.add_argument("--merc-predict-roi", action="store_true",
+                    help="Mercury crop: extrapolate the palm with its recent velocity when the fast tracker has "
+                         "no position, and enlarge the crop while the hand moves fast")
+    ap.add_argument("--merc-early", action="store_true",
+                    help="collect finished Mercury jobs and submit the next one between camera frames")
+    ap.add_argument("--merc-sched", choices=("batch", "perhand"), default="batch",
+                    help="batch: all tracked hands in one Mercury job, published together (original); "
+                         "perhand: one hand per job on the newest frame, published as soon as it is done")
     ap.add_argument("--discover-hz", type=float, default=2.0,
                     help="with --backend mercury: MediaPipe rate while Mercury is tracking a hand")
     ap.add_argument("--mercury-shadow", action="store_true",
@@ -270,6 +341,9 @@ def main():
     ap.add_argument("--log", help="append per-frame results as JSON lines")
     ap.add_argument("--seconds", type=float, default=0, help="stop after N s (0 = run forever)")
     a = ap.parse_args()
+    import handtrack.fasttrack as _ft
+    _ft.MAX_SPEED = a.max_speed
+    _ft.LK["maxLevel"] = a.lk_levels
 
     # stay off the prime core (7, the one that overheated) and below normal priority
     try:
@@ -304,6 +378,8 @@ def main():
                                         initializer=mpworker.init_mercury_proc)
         mt = MercuryTracker(palm, merc_pool, mpworker)
         mt.curl_source = a.curl_source
+        mt.sched = a.merc_sched
+        mt.predict_roi = a.merc_predict_roi
     bridge = None if a.no_bridge else Bridge()
 
     def new_stats():
@@ -389,7 +465,8 @@ def main():
         last_q = {}
         slow = {}            # side -> latest MediaPipe pose tuple (pos, quat, conf, P, curls)
         slow_t = {}          # side -> its capture time (s)
-        slow_cam_q = {"left": {}, "right": {}}   # side -> slot -> (t, quat) latest orientation per camera
+        slow_cam_q = {"left": {}, "right": {}}   # side -> slot -> (t, quat, backend) latest orientation per camera
+        slow_src = {}        # side -> backend of the latest articulated observation ("merc" / "mp")
         last_sent = {}       # side -> (t, position) last sent to the PC
         grid_t, grid_period = None, 1e9 / 60.0                       # camera frame grid (ns)
         rot_pending = {}     # side -> (t, quat) orientation outlier awaiting confirmation
@@ -401,9 +478,69 @@ def main():
         k = 0
         frame_no = 0
         last_hand = 0.0
+        def merc_service():
+            """Mercury continuous tracking: collect a finished job, then submit the next one on the
+            newest frame (imgs / t_cap / fast_pos of the last processed camera frame)."""
+            nonlocal next_merc, next_det, last_hand
+            if mt is not None:
+                for side, (pose_m, sl_m, px_m, t_m, img_m) in mt.collect().items():
+                    if side not in enabled:                 # result for a hand disabled while in flight
+                        continue
+                    slow[side], slow_t[side], slow_src[side] = pose_m, t_m, "merc"
+                    slow_cam_q[side][sl_m] = (t_m, np.asarray(pose_m[1], float), "merc")
+                    fast.seed(sl_m, side, types.SimpleNamespace(px=px_m), img_m, imgs[sl_m], t_s, pos3d=pose_m[0])
+                    last_hand = time.monotonic()
+                    if tel is not None:
+                        tel.write("K,%d,%s,%d" % (int(t_m * 1e9), side, sl_m))
+                if tel is not None:
+                    # one row per Mercury observation: capture -> submit -> worker start/end -> collect,
+                    # thread CPU vs runqueue wait, hands in the job, outcome, raw (unfiltered) orientation
+                    for rc in mt.records:
+                        q_ = rc["rq"] if rc["rq"] is not None else (0, 0, 0, 0)
+                        tel.write("R,%d,%s,%d,%d,%d,%d,%d,%d,%.2f,%.2f,%d,%s,%.4f,%.4f,%.4f,%.4f" % (
+                            rc["id"], rc["side"], rc["slot"], rc["t_cap"], rc["t_sub"], rc["t0"], rc["t1"], rc["t_col"],
+                            rc["cpu_ns"] / 1e6, rc["wait_ns"] / 1e6, rc["njob"], rc["outcome"], *q_))
+                mt.records.clear()
+                if mt.collapsed:
+                    # both trackers ended up on one physical hand: forget the dropped one everywhere and
+                    # let discovery find the other hand right away
+                    fast.hands.pop(mt.collapsed, None)
+                    slow.pop(mt.collapsed, None)
+                    slow_cam_q[mt.collapsed].clear()
+                    next_det = 0.0
+                    if tel is not None:
+                        tel.write("C,%d,%s" % (t_cap, mt.collapsed))
+                if not mt.busy() and time.monotonic() >= next_merc:
+                    # perhand: one crop per job, so the same per-hand rate cap allows n jobs per period
+                    n_ = max(1, len(mt.hands)) if a.merc_sched == "perhand" else 1
+                    iv = thermal.interval(a.merc_hz * n_)
+                    if iv is not None and mt.submit(imgs, t_cap, fast_pos):
+                        next_merc = time.monotonic() + iv
+
+
         hands_cfg = EnabledHands()
         enabled = hands_cfg.get()
+        have_frame = False
+        prof = Profile()
+        pv = dict(PROFILE_DEFAULTS)                 # apply the defaults once, then live changes
         while not stop.is_set():
+            if pv is None:
+                pv = prof.poll()
+            if pv is not None:
+                for sd in ("left", "right"):
+                    if palm is not None:
+                        fp_, fz_, fx_ = palm.filt[sd]
+                        fp_.set(pv["centre_filter"])
+                        fz_.set(pv["axis_filter"])
+                        fx_.set(pv["axis_filter"])
+                        palm.curl_filt[sd].set(pv["curl_filter"])
+                    pos_filt[sd].set(pv["pos_filter"])
+                rot_tau = (a.rot_smooth_ms if pv["rot_glide_ms"] is None else pv["rot_glide_ms"]) / 1000.0
+                if tel is not None:   # profile switch marker: the report can split results by profile
+                    tel.write("P,%d,%s" % (time.monotonic_ns(), ";".join(
+                        "%s=%s" % (k, "off" if v is None else (v if not isinstance(v, tuple) else "%g/%g" % v))
+                        for k, v in sorted(pv.items()))))
+                pv = None
             en = hands_cfg.get()
             if en != enabled:
                 for sd in ({"left", "right"} - en):          # just disabled: forget it everywhere
@@ -418,6 +555,10 @@ def main():
                 bridge.enabled_mask = (1 if "left" in enabled else 0) | (2 if "right" in enabled else 0)
             r0, r1 = shm.read(0, last[0]), shm.read(1, last[1])
             if not r0 or not r1:
+                # --merc-early: between camera frames, collect a finished Mercury job and start the next
+                # one right away instead of waiting up to a frame for the next loop pass
+                if a.merc_early and have_frame and mt is not None and mt.job is not None and mt.job[0].done():
+                    merc_service()
                 time.sleep(0.002)
                 continue
             if abs(r0[1] - r1[1]) > 8e6:          # not the same capture: wait for the lagging camera
@@ -428,6 +569,7 @@ def main():
                 continue
             last[0], last[1] = r0[0], r1[0]
             frame_no += 1
+            have_frame = True
             t_raw = min(r0[1], r1[1])
             if grid_t is None or abs(t_raw - grid_t) > 1e9:
                 grid_t = t_raw
@@ -509,7 +651,7 @@ def main():
                         continue
                     if mt is not None and side in mt.tracked() and mt.hands[side].t > t_det / 1e9:
                         continue          # Mercury already has a newer observation of this hand
-                    slow[side], slow_t[side] = p, t_det / 1e9
+                    slow[side], slow_t[side], slow_src[side] = p, t_det / 1e9, "mp"
                     qn = np.asarray(p[1], float)
                     lq = last_q.get(side)
                     accept = True
@@ -524,7 +666,7 @@ def main():
                                 accept = False
                     if accept:
                         for sl in ((0, 1) if kind == "stereo" else (slot,)):
-                            slow_cam_q[side][sl] = (t_det / 1e9, qn)
+                            slow_cam_q[side][sl] = (t_det / 1e9, qn, "mp")
                     # seed the optical-flow tracker with the detection that is geometrically ON this hand
                     pc3 = p[3][[0, 5, 9, 17]].mean(0)
                     for sl, hs in hands_by_slot.items():
@@ -559,7 +701,7 @@ def main():
                     print("mercury shadow error: %r" % (e,), file=sys.stderr, flush=True)
                     sres = []
                 rays_by = {}
-                for sl, sd, r, dsec in sres:
+                for sl, sd, r, dsec, *_ in sres:
                     if r is None:
                         continue
                     ref = next((h for h in s_hands.get(sl, []) if h.side == sd), None)
@@ -586,30 +728,7 @@ def main():
                                                                   float(np.median(e3[[0, 5, 9, 13, 17]])),
                                                                   float(np.median(gap)) * 100))
 
-            # ---- Mercury continuous tracking: collect, then submit the next cycle
-            if mt is not None:
-                for side, (pose_m, sl_m, px_m, t_m, img_m) in mt.collect().items():
-                    if side not in enabled:                 # result for a hand disabled while in flight
-                        continue
-                    slow[side], slow_t[side] = pose_m, t_m
-                    slow_cam_q[side][sl_m] = (t_m, np.asarray(pose_m[1], float))
-                    fast.seed(sl_m, side, types.SimpleNamespace(px=px_m), img_m, imgs[sl_m], t_s, pos3d=pose_m[0])
-                    last_hand = time.monotonic()
-                    if tel is not None:
-                        tel.write("K,%d,%s,%d" % (int(t_m * 1e9), side, sl_m))
-                if mt.collapsed:
-                    # both trackers ended up on one physical hand: forget the dropped one everywhere and
-                    # let discovery find the other hand right away
-                    fast.hands.pop(mt.collapsed, None)
-                    slow.pop(mt.collapsed, None)
-                    slow_cam_q[mt.collapsed].clear()
-                    next_det = 0.0
-                    if tel is not None:
-                        tel.write("C,%d,%s" % (t_cap, mt.collapsed))
-                if not mt.busy() and time.monotonic() >= next_merc:
-                    iv = thermal.interval(a.merc_hz)
-                    if iv is not None and mt.submit(imgs, t_cap, fast_pos):
-                        next_merc = time.monotonic() + iv
+            merc_service()
 
             # ---- schedule the next MediaPipe run (rate cap, thermal guard, idle mode)
             now_m = time.monotonic()
@@ -649,20 +768,21 @@ def main():
                 pos, q = (fp[0], fp[1]) if fp is not None else (None, None)
                 finfo = fast.info.get(side, {}) if fp is not None else {}
                 pos_src, pos_t = finfo.get("src", "none"), finfo.get("t_obs", t_s)
-                q_src, q_t = ("flow", t_s) if q is not None else ("mp", slow_t[side])
+                q_src, q_t = ("flow", t_s) if q is not None else (slow_src.get(side, "mp"), slow_t[side])
                 if q is None:
                     # average the two cameras' latest orientations: their single-view biases cancel
                     # instead of alternating (which looked like a few-times-a-second wobble)
                     # both cameras only if both are recent: an old estimate drags a turning hand backwards
-                    qs_ = [qq for (tq, qq) in slow_cam_q[side].values() if t_s - tq < 0.15]
+                    qs_ = [qq for (tq, qq, _) in slow_cam_q[side].values() if t_s - tq < 0.15]
                     if len(qs_) == 2:
                         a0, a1 = qs_[0], qs_[1] if qs_[0] @ qs_[1] >= 0 else -qs_[1]
                         q = (a0 + a1) / np.linalg.norm(a0 + a1)
-                        q_src, q_t = "mp_avg2", max(tq for (tq, _) in slow_cam_q[side].values())
+                        newest = max(slow_cam_q[side].values(), key=lambda e: e[0])
+                        q_src, q_t = newest[2] + "_avg2", newest[0]
                     elif slow_cam_q[side]:
                         # newest accepted orientation (never a result the outlier gate rejected)
-                        q_t, q = max(slow_cam_q[side].values(), key=lambda e: e[0])
-                        q_src = "mp_newest"
+                        q_t, q, q_be = max(slow_cam_q[side].values(), key=lambda e: e[0])
+                        q_src = q_be + "_newest"
                     else:
                         q = sp[1]
                 if pos is None and t_s - slow_t[side] < 0.15 and plausible(sp[0]):

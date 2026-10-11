@@ -10,6 +10,8 @@ for the same hand is fresh (< STEREO_MS), joints are triangulated instead.
 
 The Mercury model license is UNVERIFIED (local evaluation only).
 """
+import time
+
 import numpy as np
 
 from handtrack.calib import triangulate
@@ -29,6 +31,8 @@ class HandState:
         self.t = t
         self.hand_size = float(np.linalg.norm(self.P[0] - self.P[9]))
         self.next_slot = 1
+        self.last_submit = 0.0                    # monotonic s of the last job that included this hand
+        self.vel = np.zeros(3)                    # palm velocity (m/s) from the last two accepted observations
         self.last_rays = {}                       # slot -> (t, origin, rays head frame)
         self.misses = 0
         self.created = t
@@ -43,7 +47,13 @@ class MercuryTracker:
         self.hands = {}                           # side -> HandState
         self.job = None
         self.curl_source = "mercury"
+        self.predict_roi = False
+        self.sched = "batch"                      # "batch": all hands in one job (original);
+                                                  # "perhand": one hand per job on the newest frame,
+                                                  # least recently serviced hand first
         self.collapsed = None
+        self.next_id = 0
+        self.records = []                         # per-observation timing records, drained by the caller
         self.stats = {"runs": 0, "accepted": 0, "rejected": 0, "stereo": 0, "mono": 0, "ms": []}
 
     def tracked(self):
@@ -70,15 +80,32 @@ class MercuryTracker:
         return self.job is not None
 
     def submit(self, imgs, t_cap_ns, fast_pos):
-        """One Mercury crop per tracked hand on this frame (alternating cameras)."""
+        """One Mercury crop per tracked hand on this frame (alternating cameras); in "perhand" mode
+        only the least recently serviced hand."""
         if self.job is not None or not self.hands:
             return False
         jobs = []
-        for side, hs in self.hands.items():
+        sides = list(self.hands)
+        if self.sched == "perhand":
+            sides = [min(sides, key=lambda sd: self.hands[sd].last_submit)]
+        t_sub = time.monotonic()
+        for side in sides:
+            hs = self.hands[side]
+            hs.last_submit = t_sub
             P = hs.P
             fp = fast_pos.get(side)
+            expand = None
             if fp is not None:                    # move the ROI with the 60 Hz palm position
                 P = P + (np.asarray(fp[0]) - P[PALM_IDX[:1] + [5, 9, 17]].mean(0))
+            elif self.predict_roi:
+                # fast tracker lost the hand (typically a quick slap): put the crop where the hand is
+                # heading, not where it was (bounded extrapolation), and look wider
+                dt = min(max(t_cap_ns / 1e9 - hs.t, 0.0), 0.15)
+                P = P + hs.vel * dt
+            if self.predict_roi:
+                spd = float(np.linalg.norm(hs.vel))
+                if fp is None or spd > 1.0:
+                    expand = 1.7 * (1.35 if fp is None or spd > 2.5 else 1.15)
             slot = hs.next_slot
             hs.next_slot = 1 - slot
             R, t = self.palm.pose[slot]
@@ -89,12 +116,12 @@ class MercuryTracker:
                 jc = (P - t) @ R
                 if (jc[:, 2] < 0.08).any():
                     continue
-            jobs.append((slot, side, jc))
+            jobs.append((slot, side, jc, expand))
         if not jobs:
             return False
         used = sorted({j[0] for j in jobs})
         self.job = (self.pool.submit(self.worker.run_mercury, jobs, {s: imgs[s] for s in used}), t_cap_ns, fast_pos,
-                    {s: imgs[s] for s in used})
+                    {s: imgs[s] for s in used}, time.monotonic_ns(), len(jobs))
         return True
 
     def collect(self):
@@ -102,19 +129,27 @@ class MercuryTracker:
         Returns {side: (pose tuple, slot, det_px, t_capture_s, image_the_crop_came_from)}."""
         if self.job is None or not self.job[0].done():
             return {}
-        fut, t_ns, fast_pos, job_imgs = self.job
+        fut, t_ns, fast_pos, job_imgs, t_sub_ns, njob = self.job
         self.job = None
         t = t_ns / 1e9
+        t_col_ns = time.monotonic_ns()
         try:
             res = fut.result()
         except Exception:
             return {}
         out = {}
-        for slot, side, r, dsec in res:
+        for slot, side, r, dsec, *tim in res:
             self.stats["runs"] += 1
             self.stats["ms"].append(dsec * 1e3)
+            tim = tim[0] if tim else {}
+            rec = {"id": self.next_id, "side": side, "slot": slot, "t_cap": t_ns, "t_sub": t_sub_ns,
+                   "t0": tim.get("t0", 0), "t1": tim.get("t1", 0), "cpu_ns": tim.get("cpu_ns", 0),
+                   "wait_ns": tim.get("wait_ns", 0), "t_col": t_col_ns, "njob": njob, "outcome": "rej", "rq": None}
+            self.next_id += 1
+            self.records.append(rec)
             hs = self.hands.get(side)
             if hs is None:
+                rec["outcome"] = "gone"
                 continue
             if r is None or r["is_hand"] < 0.97:
                 self.stats["rejected"] += 1
@@ -132,6 +167,7 @@ class MercuryTracker:
                     P = Pm
                     hs.hand_size = 0.9 * hs.hand_size + 0.1 * float(np.linalg.norm(P[0] - P[9]))
                     self.stats["stereo"] += 1
+                    rec["outcome"] = "stereo"
             if P is None:
                 # single view: rays + Mercury's relative depths; absolute depth of the middle knuckle from
                 # the 60 Hz stereo palm position if fresh, else from the previous state
@@ -145,13 +181,23 @@ class MercuryTracker:
                 if fp is not None:
                     P = P + (anchor - P[[0, 5, 9, 17]].mean(0))
                 self.stats["mono"] += 1
+                rec["outcome"] = "mono"
             jump = np.linalg.norm(P[[0, 5, 9, 17]].mean(0) - hs.P[[0, 5, 9, 17]].mean(0))
             if jump > 0.25 and t - hs.t < 0.2:         # implausible: keep the old state, count a miss
                 self.stats["rejected"] += 1
                 hs.misses += 1
+                rec["outcome"] = "jump"
                 continue
+            dtv = t - hs.t
+            if 0.005 < dtv < 0.2:
+                v = (self.palm_c(P) - self.palm_c(hs.P)) / dtv
+                sp = np.linalg.norm(v)
+                hs.vel = v * min(1.0, 6.0 / sp) if sp > 0 else v      # bounded: 6 m/s
+            else:
+                hs.vel = np.zeros(3)
             hs.P, hs.t, hs.misses = P, t, 0
             self.stats["accepted"] += 1
+            rec["rq"] = self.palm.raw_quat(side, P)
             hs.curls_by_view[slot] = (t, np.asarray(r["curls"], float), np.asarray(r["curl_var"], float))
             if self.curl_source == "mercury":
                 # Mercury's own curl output (consistent across views): variance-weighted mean of fresh views

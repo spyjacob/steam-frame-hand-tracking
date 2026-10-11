@@ -40,7 +40,16 @@ class OneEuro:
 
     def __init__(self, min_cutoff=1.5, beta=0.6, d_cutoff=1.0):
         self.min_cutoff, self.beta, self.d_cutoff = min_cutoff, beta, d_cutoff
+        self.bypass = False                       # profile "off": pass measurements straight through
         self.x = self.dx = self.t = None
+
+    def set(self, params):
+        """params: (min_cutoff, beta) or None = bypass.  State is kept, so switching is seamless."""
+        if params is None:
+            self.bypass = True
+        else:
+            self.bypass = False
+            self.min_cutoff, self.beta = params
 
     @staticmethod
     def _a(cutoff, dt):
@@ -49,10 +58,15 @@ class OneEuro:
 
     def __call__(self, x, t):
         x = np.asarray(x, float)
-        if self.x is None or t - self.t > 0.3:
+        if self.x is not None and t <= self.t:
+            # same or older measurement than the last one (re-fed, or a slow result arriving after a
+            # newer one): it is not new information, and a non-positive dt must not become a fake
+            # velocity spike.  Keep the current state.
+            return self.x
+        if self.bypass or self.x is None or t - self.t > 0.3:
             self.x, self.dx, self.t = x, np.zeros_like(x), t
             return x
-        dt = max(t - self.t, 1e-3)
+        dt = t - self.t
         dx = (x - self.x) / dt
         ad = self._a(self.d_cutoff, dt)
         self.dx = ad * dx + (1 - ad) * self.dx
@@ -234,7 +248,8 @@ class PalmTracker:
             out[side] = self._pose(side, P, t_cap, conf=h.side_score * 0.9) + (curls,)
         return out
 
-    def _pose(self, side, P, t, conf):
+    def _axes(self, side, P):
+        """Unfiltered palm centre and (x, z) axes from 21 joints."""
         wrist, idx, mid, ring, pinky = P[0], P[5], P[9], P[13], P[17]
         centre = (wrist + idx + mid + pinky) / 4
         fwd = (idx + mid + ring + pinky) / 4 - wrist   # wrist -> knuckle line: along the fingers
@@ -245,6 +260,15 @@ class PalmTracker:
             x = -x
         x = x - z * (x @ z)
         x /= np.linalg.norm(x)
+        return centre, x, z
+
+    def raw_quat(self, side, P):
+        """Orientation of one observation with no filtering (telemetry: filter-lag measurement)."""
+        _, x, z = self._axes(side, P)
+        return quat_from_R(np.stack([x, np.cross(z, x), z], 1))
+
+    def _pose(self, side, P, t, conf):
+        centre, x, z = self._axes(side, P)
         fp, fz, fx = self.filt[side]
         centre = fp(centre, t)
         z = fz(z, t)
