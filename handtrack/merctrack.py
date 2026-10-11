@@ -82,9 +82,11 @@ class MercuryTracker:
     def busy(self):
         return self.job is not None
 
-    def submit(self, imgs, t_cap_ns, fast_pos):
+    def submit(self, imgs, t_cap_ns, fast_pos, anchor_pos=None):
         """One Mercury crop per tracked hand on this frame (alternating cameras); in "perhand" mode
-        only the least recently serviced hand."""
+        only the least recently serviced hand.  fast_pos places the crop (its image location is right
+        even when its depth is held); anchor_pos (default fast_pos) is the depth anchor for single-view
+        joints and should only contain trustworthy (two-camera) positions."""
         if self.job is not None or not self.hands:
             return False
         jobs = []
@@ -128,6 +130,8 @@ class MercuryTracker:
         used = sorted({j[0] for j in jobs})
         self.job = (self.pool.submit(self.worker.run_mercury, jobs, {s: imgs[s] for s in used}), t_cap_ns, fast_pos,
                     {s: imgs[s] for s in used}, time.monotonic_ns(), len(jobs))
+        if anchor_pos is not None:
+            self.job = self.job[:2] + (anchor_pos,) + self.job[3:]
         return True
 
     def collect(self):

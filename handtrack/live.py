@@ -326,6 +326,10 @@ def main():
                     help="finger curls from the newest observation only (no blend with older views of other cameras)")
     ap.add_argument("--merc-hint-reset", action="store_true",
                     help="no keypoint hint for Mercury crops placed after a rejected observation or lost flow")
+    ap.add_argument("--flow-v2", action="store_true",
+                    help="fast tracker: frame-by-frame re-seeding through a short frame history, single-camera "
+                         "depth held at most 0.2 s, a lost camera rebuilt from the newest Mercury hand, and "
+                         "Mercury's depth anchor taken only from two-camera positions")
     ap.add_argument("--merc-early", action="store_true",
                     help="collect finished Mercury jobs and submit the next one between camera frames")
     ap.add_argument("--merc-sched", choices=("batch", "perhand"), default="batch",
@@ -471,6 +475,16 @@ def main():
         nonlocal stats
         last = {0: 0, 1: 0}
         fast = FastTracker(palm, orient=a.fast_orient, blend_s=a.blend_ms / 1000.0)
+        fast.v2 = a.flow_v2
+        v2_print = [time.monotonic()]
+
+        def v2_report():
+            if a.flow_v2 and time.monotonic() - v2_print[0] > 5.0:
+                v2_print[0] = time.monotonic()
+                print("   flow v2: %s" % (dict(fast.stats) or "{}"), file=sys.stderr, flush=True)
+                if tel is not None and fast.stats:
+                    tel.write("V,%d,%s" % (time.monotonic_ns(), ";".join("%s=%d" % kv for kv in sorted(fast.stats.items()))))
+                fast.stats.clear()
         rot_tau = a.rot_smooth_ms / 1000.0
         # adaptive: strong smoothing when the hand is nearly still, little when it moves fast
         pos_filt = {sd: OneEuro(1.2, 1.5) for sd in ("left", "right")}
@@ -502,6 +516,12 @@ def main():
                     slow[side], slow_t[side], slow_src[side] = pose_m, t_m, "merc"
                     slow_cam_q[side][sl_m] = (t_m, np.asarray(pose_m[1], float), "merc")
                     fast.seed(sl_m, side, types.SimpleNamespace(px=px_m), img_m, imgs[sl_m], t_s, pos3d=pose_m[0])
+                    try:
+                        fast.recover_view(side, pose_m[3], t_m)   # v2: rebuild the other camera if lost
+                    except Exception as e:                        # never let the experiment stop tracking
+                        fast.stats["recover_error"] += 1
+                        if fast.stats["recover_error"] == 1:
+                            print("flow v2 recover_view error: %r" % (e,), file=sys.stderr, flush=True)
                     last_hand = time.monotonic()
                     if tel is not None:
                         tel.write("K,%d,%s,%d" % (int(t_m * 1e9), side, sl_m))
@@ -527,7 +547,12 @@ def main():
                     # perhand: one crop per job, so the same per-hand rate cap allows n jobs per period
                     n_ = max(1, len(mt.hands)) if a.merc_sched == "perhand" else 1
                     iv = thermal.interval(a.merc_hz * n_)
-                    if iv is not None and mt.submit(imgs, t_cap, fast_pos):
+                    # v2: Mercury anchors single-view depth only to a two-camera position, never to a held
+                    # single-camera depth (that error would otherwise propagate into the joints); the crop is
+                    # still placed with every fast position (its image location is right)
+                    fp_ = {sd: v for sd, v in fast_pos.items()
+                           if not a.flow_v2 or fast.info.get(sd, {}).get("src") == "stereo"}
+                    if iv is not None and mt.submit(imgs, t_cap, fast_pos, anchor_pos=fp_):
                         next_merc = time.monotonic() + iv
 
 
@@ -601,6 +626,7 @@ def main():
             tf = time.perf_counter()
             skip_frame = thermal.temp >= thermal.SLOWER_C and frame_no % 2 == 1
             fast_pos = {} if skip_frame else fast.step(imgs, t_s)
+            v2_report()
             fast_ms = (time.perf_counter() - tf) * 1e3
 
             # ---- slow path: collect a finished MediaPipe run, re-seed the tracker

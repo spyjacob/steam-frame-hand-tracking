@@ -164,3 +164,42 @@ Remaining, next per the research: the depth excursions come from the fast optica
 (one camera lost → depth held; delayed reseeding jumps several frames at once; imputed points enter
 triangulation). Next deliverable: recovery state machine with sequential reseeding and
 measured-versus-imputed landmark tracking (`handtrack/fasttrack.py`, new `handtrack/recovery.py`).
+
+## Pass 3, step 2 (2026-10-11 16:12): fast-path depth repair (`--flow-v2`) — adopted
+
+The depth excursions came from the 60 Hz optical-flow position path: with one camera lost it kept the last
+distance along the remaining ray ("mono_ray") indefinitely, Mercury then anchored its single-view joints to
+that held depth, and a delayed re-seed jumped from the detection frame to the newest frame in one LK step.
+`--flow-v2`:
+- re-seeds frame by frame through an 8-frame history (`FastTracker._advance`);
+- holds single-camera depth at most 0.2 s, then reports nothing instead of a confidently wrong depth;
+- rebuilds a lost camera from the newest Mercury hand, projected into that camera's frame of the same
+  capture and followed to the newest frame (`FastTracker.recover_view`);
+- Mercury's single-view depth anchor comes only from two-camera positions (`anchor_pos`), while its crop is
+  still placed with every fast position.
+
+First version also routed crop placement through the stereo-only positions; that turned ordinary frames
+into hint-less "recovery" crops (111 vs 4) and caused orientation spikes (p99 82 deg). Fixed before adoption.
+
+Right hand, 30 s each, repeated slaps toward/away and sideways (same session):
+
+| | current (step 1) | `--flow-v2` (final) |
+|---|---|---|
+| single-camera position frames | 246 | **25** |
+| two-camera position frames | 613 | **825** |
+| Mercury rejected | 69 | **13** |
+| hint-less recovery crops (accepted) | 70 (46) | 14 (14) |
+| rotation step p99 | 94 deg | **35 deg** |
+| orientation error at best alignment | 17.3 deg | **10.3 deg** |
+| gap between accepted observations p95 / p99 | 100 / 183 ms | **70 / 104 ms** |
+| frozen | 2.2 s | 2.0 s (of 20 s) |
+| palm position jumps > 5 cm/frame | 4 | **11** |
+| health | | mean 75 °C, max 85; late-ISR +2; 0 dropped |
+
+User: first half "total breakdown and depth issue"; second "much better", but brief depth jumps (once closer
+to the face, some outward) that recover faster than before. "Palm out, slap away" is hard in both.
+
+Open: the remaining short position jumps coincide with rebuilt/re-seeded views (the two cameras briefly
+disagree). Next: require cross-camera agreement (reprojection / ray-gap check against the current stereo
+estimate) before a rebuilt view is used, and blend rather than snap after recovery; then the recovery state
+machine for edge-on, blurred hands.

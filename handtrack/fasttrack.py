@@ -17,6 +17,7 @@ still come from it.  Coordinates are the rotated detector images (det_size
 square), the frame MediaPipe's landmarks are in; PalmTracker.rays() maps them
 to head-frame rays.
 """
+import collections
 import math
 
 import cv2
@@ -131,6 +132,7 @@ class HandTrack:
         self.corr_pos = np.zeros(3)
         self.corr_q = np.array([1.0, 0, 0, 0])
         self.corr_t = 0.0
+        self.mono_since = None    # time the track fell back to one camera (v2: bounded)
 
 
 class FastTracker:
@@ -143,6 +145,12 @@ class FastTracker:
         self.lost = set()         # slots where a hand track just failed -> caller re-detects there now
         self.info = {}
         self._src = "none"
+        # v2 (--flow-v2): frame history for frame-by-frame re-seeding, bounded single-camera depth,
+        # rebuilding a lost camera from a 3D hand observation
+        self.v2 = False
+        self.mono_max_s = 0.2
+        self.hist = {}            # slot -> deque of (t, image), newest last
+        self.stats = collections.Counter()
 
     # ------------------------------------------------------------ seeding
     def seed(self, slot, side, hand, det_img, cur_img, t, pos3d=None):
@@ -159,7 +167,7 @@ class FastTracker:
                 extra = f.reshape(-1, 2).astype(np.float32)
         ct = CamTrack(lm, extra)
         if det_img is not None and cur_img is not None and det_img is not cur_img:
-            if not ct.step(det_img, cur_img):
+            if not self._advance(ct, slot, det_img, cur_img):
                 return
         ht = self.hands.setdefault(side, HandTrack())
         ht.cams[slot] = ct
@@ -168,13 +176,79 @@ class FastTracker:
         if pos3d is not None and plausible(pos3d) and (ht.last_pos is None or t - ht.last_pos_t > 0.3):
             ht.last_pos, ht.last_pos_t = np.asarray(pos3d, float), t
 
+    def _advance(self, ct, slot, src_img, cur_img):
+        """Carry a CamTrack from src_img to cur_img.  v2: through every retained frame in between
+        (a slap can reverse within the gap; one big LK step mis-tracks it).  Falls back to one step
+        when src_img is not in the history."""
+        if self.v2:
+            try:
+                return self._advance_hist(ct, slot, src_img, cur_img)
+            except Exception as e:                    # never let the experiment stop tracking
+                self.stats["advance_error"] += 1
+                if self.stats["advance_error"] == 1:
+                    print("flow v2 advance error: %r" % (e,), flush=True)
+        return ct.step(src_img, cur_img)
+
+    def _advance_hist(self, ct, slot, src_img, cur_img):
+        if True:
+            h = self.hist.get(slot, ())
+            idx = next((i for i, (_, im) in enumerate(h) if im is src_img), None)
+            if idx is not None:
+                prev = src_img
+                for _, im in list(h)[idx + 1:]:
+                    if not ct.step(prev, im):
+                        self.stats["reseed_fail"] += 1
+                        return False
+                    prev = im
+                if prev is not cur_img and not ct.step(prev, cur_img):
+                    return False
+                self.stats["reseed_steps"] += len(h) - idx - 1
+                return True
+            self.stats["reseed_nohist"] += 1
+        return ct.step(src_img, cur_img)
+
+    def recover_view(self, side, P, t_obs):
+        """v2: a hand tracked in only one camera gets its other camera rebuilt from a 3D observation
+        (21 joints, head frame) made at capture time t_obs: project the palm landmarks into that
+        camera's frame of the same capture, then follow them to the newest frame."""
+        if not self.v2:
+            return False
+        ht = self.hands.get(side)
+        if ht is None or len(ht.cams) != 1:
+            return False
+        slot = 1 - next(iter(ht.cams))
+        h = self.hist.get(slot)
+        if not h:
+            return False
+        src = next((im for (tt, im) in h if abs(tt - t_obs) < 1e-4), None)
+        if src is None:
+            self.stats["recover_noframe"] += 1
+            return False
+        R, tc = self.palm.pose[slot]
+        if (((np.asarray(P) - tc) @ R)[:, 2] < 0.08).any():
+            return False
+        px = self.palm.det_px(slot, np.asarray(P))
+        S = src.shape[0]
+        if (px < 4).any() or (px > S - 5).any():
+            return False
+        lm = px[LM_IDX].astype(np.float32)
+        mask = np.zeros(src.shape[:2], np.uint8)
+        cv2.fillConvexPoly(mask, cv2.convexHull(px.astype(np.int32)), 255)
+        f = cv2.goodFeaturesToTrack(src, maxCorners=N_EXTRA, qualityLevel=0.01, minDistance=8, mask=mask)
+        ct = CamTrack(lm, f.reshape(-1, 2) if f is not None else np.zeros((0, 2), np.float32))
+        if not self._advance(ct, slot, src, h[-1][1]):
+            return False
+        ht.cams[slot] = ct
+        self.stats["recovered_view"] += 1
+        return True
+
     def drop_stale(self, t, max_age=1.0):
         for side in list(self.hands):
             if t - self.hands[side].t_confirm > max_age:
                 del self.hands[side]
 
     # ------------------------------------------------------------ per frame
-    def _raw(self, side, ht):
+    def _raw(self, side, ht, t=None):
         """Unblended estimate from the current tracks: (pos, quat or None)."""
         if 0 in ht.cams and 1 in ht.cams:
             o1, d1 = self.palm.rays(1, ht.cams[1].lm)
@@ -188,9 +262,18 @@ class FastTracker:
                     R = palm_frame(side, P[0], P[2], P[3], P[4], P[5], self.palm.roll_flip)
                     q = quat_from_R(R)
                 self._src = "stereo"
+                ht.mono_since = None
                 return pos, q
         if ht.cams and ht.last_pos is not None and ht.last_pos_t > 0:
-            # one camera: keep the last distance along the new centre ray
+            # one camera: keep the last distance along the new centre ray.  v2: only briefly; a held
+            # depth during fast in/out motion is confidently wrong, so report nothing instead
+            if self.v2 and t is not None:
+                if ht.mono_since is None:
+                    ht.mono_since = t
+                elif t - ht.mono_since > self.mono_max_s:
+                    self.stats["mono_expired"] += 1
+                    self._src = "none"
+                    return None, None
             slot, ct = next(iter(ht.cams.items()))
             o, d = self.palm.rays(slot, ct.centre.reshape(1, 2))
             self._src = "mono_ray%d" % slot
@@ -208,7 +291,7 @@ class FastTracker:
                 if slot in imgs and slot in self.prev and not ct.step(self.prev[slot], imgs[slot]):
                     del ht.cams[slot]
                     self.lost.add(slot)
-            pos, q = self._raw(side, ht)
+            pos, q = self._raw(side, ht, t)
             # plausibility: near the face, and no faster than a real hand moves
             if pos is not None and ht.last_pos is not None and t - ht.last_pos_t < 0.5:
                 if np.linalg.norm(pos - ht.last_pos) > MAX_SPEED * (t - ht.last_pos_t) + 0.03:
@@ -244,4 +327,7 @@ class FastTracker:
             self.info[side] = {"src": self._src, "t_obs": t,
                                "npts": {sl: (len(c.lm) + len(c.extra)) for sl, c in ht.cams.items()}}
         self.prev = dict(imgs)
+        if self.v2:
+            for sl, im in imgs.items():
+                self.hist.setdefault(sl, collections.deque(maxlen=8)).append((t, im))
         return out
