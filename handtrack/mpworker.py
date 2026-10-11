@@ -85,12 +85,14 @@ def run_mercury(jobs, imgs):
     for job in jobs:
         slot, side, jc = job[:3]
         expand = job[3] if len(job) > 3 else None
+        hint = job[4] if len(job) > 4 else True
         s0, t0, td = _schedstat(), time.monotonic_ns(), time.perf_counter()
-        r = mk.run(slot, imgs[slot], jc, flip=(side == "right"), expand=expand)
+        r = mk.run(slot, imgs[slot], jc, flip=(side == "right"), expand=expand, use_hint=hint)
         dsec, t1, s1 = time.perf_counter() - td, time.monotonic_ns(), _schedstat()
         if r is not None:
             r.pop("crop", None)
-        out.append((slot, side, r, dsec, {"t0": t0, "t1": t1, "cpu_ns": s1[0] - s0[0], "wait_ns": s1[1] - s0[1]}))
+        out.append((slot, side, r, dsec, {"t0": t0, "t1": t1, "cpu_ns": s1[0] - s0[0], "wait_ns": s1[1] - s0[1],
+                                          "hint": hint}))
     return out
 
 

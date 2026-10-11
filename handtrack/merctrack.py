@@ -48,6 +48,9 @@ class MercuryTracker:
         self.job = None
         self.curl_source = "mercury"
         self.predict_roi = False
+        self.stereo_ms = STEREO_MS                # max capture-time gap for triangulating two views (0 = same capture only)
+        self.curl_latest = False                  # True: curls from this observation only (no blend with older views)
+        self.hint_reset = False                   # True: no keypoint hint for a crop placed after a miss / lost flow
         self.sched = "batch"                      # "batch": all hands in one job (original);
                                                   # "perhand": one hand per job on the newest frame,
                                                   # least recently serviced hand first
@@ -116,7 +119,10 @@ class MercuryTracker:
                 jc = (P - t) @ R
                 if (jc[:, 2] < 0.08).any():
                     continue
-            jobs.append((slot, side, jc, expand))
+            # a crop after a rejected observation or without a fresh flow position is a recovery crop:
+            # the previous keypoints describe a hand that is no longer there, so do not feed them as a hint
+            hint = not (self.hint_reset and (hs.misses > 0 or fp is None))
+            jobs.append((slot, side, jc, expand, hint))
         if not jobs:
             return False
         used = sorted({j[0] for j in jobs})
@@ -144,7 +150,8 @@ class MercuryTracker:
             tim = tim[0] if tim else {}
             rec = {"id": self.next_id, "side": side, "slot": slot, "t_cap": t_ns, "t_sub": t_sub_ns,
                    "t0": tim.get("t0", 0), "t1": tim.get("t1", 0), "cpu_ns": tim.get("cpu_ns", 0),
-                   "wait_ns": tim.get("wait_ns", 0), "t_col": t_col_ns, "njob": njob, "outcome": "rej", "rq": None}
+                   "wait_ns": tim.get("wait_ns", 0), "t_col": t_col_ns, "njob": njob, "outcome": "rej", "rq": None,
+                   "hint": int(tim.get("hint", True))}
             self.next_id += 1
             self.records.append(rec)
             hs = self.hands.get(side)
@@ -160,7 +167,8 @@ class MercuryTracker:
             hs.last_rays[slot] = (t, o, rays)
             other = hs.last_rays.get(1 - slot)
             P = None
-            if other is not None and (t - other[0]) * 1e3 < STEREO_MS:
+            if other is not None and abs(t - other[0]) * 1e3 <= self.stereo_ms and \
+                    (self.stereo_ms > 0 or t == other[0]):
                 (to, oo, ro) = other
                 Pm, gap, s1, s2 = triangulate(np.broadcast_to(o, rays.shape), rays, np.broadcast_to(oo, ro.shape), ro)
                 if np.median(gap) < 0.02 and (s1 > 0.05).all() and (s2 > 0.05).all():
@@ -201,7 +209,8 @@ class MercuryTracker:
             hs.curls_by_view[slot] = (t, np.asarray(r["curls"], float), np.asarray(r["curl_var"], float))
             if self.curl_source == "mercury":
                 # Mercury's own curl output (consistent across views): variance-weighted mean of fresh views
-                vs = [(c, v) for (tc, c, v) in hs.curls_by_view.values() if t - tc < 0.2]
+                vs = [(c, v) for (tc, c, v) in hs.curls_by_view.values() if t - tc < 0.2] if not self.curl_latest \
+                    else [hs.curls_by_view[slot][1:]]
                 wsum = sum(1 / v for _, v in vs)
                 mc = sum(c / v for c, v in vs) / wsum
                 raw_curls = np.clip(-mc / np.array(CURL_SCALE), 0, 1)

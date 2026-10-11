@@ -319,6 +319,13 @@ def main():
     ap.add_argument("--merc-predict-roi", action="store_true",
                     help="Mercury crop: extrapolate the palm with its recent velocity when the fast tracker has "
                          "no position, and enlarge the crop while the hand moves fast")
+    ap.add_argument("--merc-stereo-ms", type=float, default=40.0,
+                    help="max capture-time gap (ms) for triangulating two Mercury views; 0 = only the same capture "
+                         "(views from different times describe different hand poses when the hand moves)")
+    ap.add_argument("--curl-latest", action="store_true",
+                    help="finger curls from the newest observation only (no blend with older views of other cameras)")
+    ap.add_argument("--merc-hint-reset", action="store_true",
+                    help="no keypoint hint for Mercury crops placed after a rejected observation or lost flow")
     ap.add_argument("--merc-early", action="store_true",
                     help="collect finished Mercury jobs and submit the next one between camera frames")
     ap.add_argument("--merc-sched", choices=("batch", "perhand"), default="batch",
@@ -380,6 +387,12 @@ def main():
         mt.curl_source = a.curl_source
         mt.sched = a.merc_sched
         mt.predict_roi = a.merc_predict_roi
+        mt.stereo_ms = a.merc_stereo_ms
+        mt.curl_latest = a.curl_latest
+        mt.hint_reset = a.merc_hint_reset
+        print("mercury: stereo<=%.0f ms, curls=%s, hint reset=%s, roi predict=%s, sched=%s" % (
+            mt.stereo_ms, "latest" if mt.curl_latest else "blend", mt.hint_reset, mt.predict_roi, mt.sched),
+            file=sys.stderr, flush=True)
     bridge = None if a.no_bridge else Bridge()
 
     def new_stats():
@@ -497,9 +510,9 @@ def main():
                     # thread CPU vs runqueue wait, hands in the job, outcome, raw (unfiltered) orientation
                     for rc in mt.records:
                         q_ = rc["rq"] if rc["rq"] is not None else (0, 0, 0, 0)
-                        tel.write("R,%d,%s,%d,%d,%d,%d,%d,%d,%.2f,%.2f,%d,%s,%.4f,%.4f,%.4f,%.4f" % (
+                        tel.write("R,%d,%s,%d,%d,%d,%d,%d,%d,%.2f,%.2f,%d,%s,%.4f,%.4f,%.4f,%.4f,%d" % (
                             rc["id"], rc["side"], rc["slot"], rc["t_cap"], rc["t_sub"], rc["t0"], rc["t1"], rc["t_col"],
-                            rc["cpu_ns"] / 1e6, rc["wait_ns"] / 1e6, rc["njob"], rc["outcome"], *q_))
+                            rc["cpu_ns"] / 1e6, rc["wait_ns"] / 1e6, rc["njob"], rc["outcome"], *q_, rc["hint"]))
                 mt.records.clear()
                 if mt.collapsed:
                     # both trackers ended up on one physical hand: forget the dropped one everywhere and

@@ -134,3 +134,33 @@ shared pyramids; SCHED_IDLE vs bounded SCHED_OTHER A/B; ORT profiling, XNNPACK b
 quantization, ncnn Vulkan; PC interpolation 17 → 8 → 0 ms and short-horizon prediction; per-component
 source timestamps in the UDP packet; kinematic fit; external motion-to-photon measurement.
 See RESEARCH_BRIEF_V3.md.
+
+## Pass 3, step 1 (2026-10-11 16:00): stale-observation repairs — adopted
+
+From the pass-3 research (Plan A, first deliverable). Right hand, profile A, `--merc-early`, 30 s each,
+mostly repeated slaps plus single-finger bends. Same session, matched conditions.
+
+| | old | `--merc-stereo-ms 0 --curl-latest --merc-hint-reset` |
+|---|---|---|
+| orientation error at best alignment while turning | 16.5 deg | **8.6 deg** |
+| gap between accepted observations p95 / p99 | 85 / 488 ms | 84 / **167 ms** |
+| not sent (gaps > 100 ms) / frozen | 2.7 s / 1.1 s | 1.9 s / 1.3 s (of ~23 s) |
+| Mercury rejected / implausible jump | 28 / 5 | 15 / 0 |
+| recovery crops without hint | n/a | 18 (17 accepted) |
+| palm position jumps > 5 cm/frame | 4 | 6 (fast-path position, not Mercury) |
+| orientation lag | 130 ms | 135 ms |
+| health | | mean 81 °C, max 89; late-ISR +2; 0 dropped |
+
+User: "definitely improved", but depth was lost once, fast motion is still limited, and processing
+cadence feels inconsistent. Adopted as defaults in `start_args`:
+- `--merc-stereo-ms 0`: no triangulation of two views from different capture times (a moving hand is in
+  different places; with alternating single-view crops this means Mercury joints are single-view + the
+  60 Hz stereo palm anchor).
+- `--curl-latest`: curls from the newest observation only (no blending with views up to 200 ms old).
+- `--merc-hint-reset`: crops placed after a rejected observation or lost flow run without the stale
+  keypoint hint (Mercury's own no-hint input convention).
+
+Remaining, next per the research: the depth excursions come from the fast optical-flow position path
+(one camera lost → depth held; delayed reseeding jumps several frames at once; imputed points enter
+triangulation). Next deliverable: recovery state machine with sequential reseeding and
+measured-versus-imputed landmark tracking (`handtrack/fasttrack.py`, new `handtrack/recovery.py`).

@@ -79,6 +79,10 @@ def main():
         print("   inference thread CPU ms %s | runqueue wait ms %s" % (
             pct([float(r[9]) for r in Rr]), pct([float(r[10]) for r in Rr])))
         print("   back to tracker (end->collect: IPC + loop cadence) ms %s" % ms(col - t1))
+        nohint = [r for r in Rr if len(r) > 17 and r[17] == "0"]
+        if nohint:
+            print("   crops WITHOUT keypoint hint (recovery): %d, outcomes %s" % (
+                len(nohint), dict(collections.Counter(r[12] for r in nohint))))
         acc = np.array([r[12] in ("mono", "stereo") for r in Rr])
         print("   NEW-RESULT LATENCY cap->collect, accepted only ms %s" % pct(((col - cap) / 1e6)[ok & acc]))
         for side in ("left", "right"):
@@ -134,6 +138,12 @@ def main():
             dp = np.linalg.norm(np.diff(P, axis=0), axis=1) * 1000
             dq = np.degrees(2 * np.arccos(np.clip(np.abs(np.sum(Q[1:] * Q[:-1], axis=1)), 0, 1)))
             print("   step per sent frame: position mm %s | rotation deg %s" % (pct(dp), pct(dq)))
+            # tracking loss: time not sent (gaps > 100 ms) + time frozen ("hold"); depth/position excursions
+            gaps = np.diff(ts) / 1e9
+            lost_s = float(np.sum(gaps[gaps > 0.1]))
+            hold_s = sum(1 for r in R if r[4] == "hold") / 60.0
+            print("   LOST: not sent %.1f s (%d gaps >100 ms) + frozen %.1f s, of %.1f s | position jumps >5 cm/frame: %d" % (
+                lost_s, int(np.sum(gaps > 0.1)), hold_s, span, int(np.sum(dp > 50))))
             still = (dp < 0.3) & (np.diff(ts) < 40e6)     # palm moving < ~18 mm/s, consecutive frames
             if still.sum() > 30:
                 print("   STILL hand (%d frames): rotation jitter deg/frame %s" % (still.sum(), pct(dq[still])))
