@@ -121,3 +121,9 @@ models (`tools/fetch_models.sh`; the Mercury model's license is unverified, so i
 redistributed), virtual environments, build outputs.
 
 Separate project: the chroma-key passthrough (mr-chroma), not part of this repo.
+
+## License
+
+MIT (see [LICENSE](LICENSE)) for this project's code. `pcdriver/third_party/openvr_handsim` is Valve's
+OpenVR SDK sample under its own BSD-3 license (see its NOTICE.md). Models are not included; they
+are downloaded by `tools/fetch_models.sh` under their own terms.
