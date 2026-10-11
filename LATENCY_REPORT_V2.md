@@ -203,3 +203,41 @@ Open: the remaining short position jumps coincide with rebuilt/re-seeded views (
 disagree). Next: require cross-camera agreement (reprojection / ray-gap check against the current stereo
 estimate) before a rebuilt view is used, and blend rather than snap after recovery; then the recovery state
 machine for edge-on, blurred hands.
+
+## Pass 3, step 3 (2026-10-11 16:15): cross-camera agreement check (`--flow-agree`) — not adopted
+
+A re-seeded or rebuilt view had to triangulate with the other camera (median ray gap < 2.5 cm) and land
+within 6 cm of the current position; three rejections in a row dropped the other camera instead.
+
+| | step 1 + `--flow-v2` | + `--flow-agree` |
+|---|---|---|
+| rotation step p99 | 102 deg | 37 deg |
+| frozen | 2.8 s | 0.5 s (of ~21 s) |
+| palm position jumps > 5 cm/frame | 11 | 4 |
+| hint-less recovery crops | 87 | 13 |
+| agreement rejections / overrides | n/a | ~113 / 21 |
+
+The numbers improved, but the user felt "lots of explosive" motion in **both** halves. The same
+configuration (step 1 + `--flow-v2`) measured very differently from the previous run (hint-less crops 14 vs
+87, rotation p99 35 vs 102 deg), so run-to-run variance in this 30 s slap protocol is large and the felt
+result did not follow the metrics.
+
+## Final state after pass 3 (2026-10-11 16:20)
+
+User decision: back to the end of pass 2, keeping only the depth repair. User verdict on the result:
+"decent enough".
+
+`start_args`: `--backend mercury --merc-early --flow-v2` (+ smoothing profile A default).
+
+Turned off again (still available as switches): `--merc-stereo-ms 0`, `--curl-latest`,
+`--merc-hint-reset` (the hint-less recovery crops coincided with the explosive orientation spikes), and
+`--flow-agree`. Note: with `--merc-hint-reset` off, `--flow-v2`'s stereo-only depth anchor no longer turns
+ordinary crops into hint-less ones.
+
+Lessons for the next pass:
+- 30 s slap A/Bs are too short and too variable to separate these changes; use longer, repeated,
+  interleaved trials (ABAB) and a fixed motion script before trusting a difference.
+- Headset metrics (rejects, jumps, single-camera frames) did not reliably predict the felt quality of
+  fast motion. A felt-quality score per trial should be recorded alongside them.
+- The remaining fast-motion problems need the bigger research items: a recovery state machine, PC-side
+  kinematic fitting (RESEARCH_BRIEF_V3 / pass-3 research Plan B) and timestamp-aware fusion (Plan C).

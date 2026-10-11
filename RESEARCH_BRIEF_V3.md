@@ -107,3 +107,7 @@ algorithms), each judged against the constraints in §2:
 - Speed gate 8 m/s + 4-level LK + velocity-extrapolated, enlarged Mercury crop for slaps (less loss,
   wrong depth and orientation).
 - SLAM/side cameras (not reachable), XRService's own hand models (not exposed).
+- Pass 3 (see LATENCY_REPORT_V2.md): no cross-time stereo, newest-only curls and hint reset on recovery
+  (better metrics, but hint-less recovery crops coincided with explosive wrist motion: reverted);
+  fast-path depth repair `--flow-v2` (kept: single-camera depth frames down ~10x); cross-camera agreement
+  check for rebuilt views (better metrics, felt no better: reverted).

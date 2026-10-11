@@ -330,6 +330,9 @@ def main():
                     help="fast tracker: frame-by-frame re-seeding through a short frame history, single-camera "
                          "depth held at most 0.2 s, a lost camera rebuilt from the newest Mercury hand, and "
                          "Mercury's depth anchor taken only from two-camera positions")
+    ap.add_argument("--flow-agree", action="store_true",
+                    help="fast tracker: a re-seeded or rebuilt camera view is used only if it agrees with the other "
+                         "camera and with the current position (prevents short depth jumps)")
     ap.add_argument("--merc-early", action="store_true",
                     help="collect finished Mercury jobs and submit the next one between camera frames")
     ap.add_argument("--merc-sched", choices=("batch", "perhand"), default="batch",
@@ -476,6 +479,7 @@ def main():
         last = {0: 0, 1: 0}
         fast = FastTracker(palm, orient=a.fast_orient, blend_s=a.blend_ms / 1000.0)
         fast.v2 = a.flow_v2
+        fast.agree = a.flow_agree
         v2_print = [time.monotonic()]
 
         def v2_report():

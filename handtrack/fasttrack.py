@@ -149,6 +149,8 @@ class FastTracker:
         # rebuilding a lost camera from a 3D hand observation
         self.v2 = False
         self.mono_max_s = 0.2
+        self.agree = False        # --flow-agree: a new/rebuilt camera view must agree with the other camera
+        self.agree_jump = 0.06    # m: and with the current position (if fresh)
         self.hist = {}            # slot -> deque of (t, image), newest last
         self.stats = collections.Counter()
 
@@ -170,6 +172,8 @@ class FastTracker:
             if not self._advance(ct, slot, det_img, cur_img):
                 return
         ht = self.hands.setdefault(side, HandTrack())
+        if not self._agrees(ht, slot, ct, t):
+            return
         ht.cams[slot] = ct
         ht.t_confirm = t
         ht.reseeded = True
@@ -238,9 +242,42 @@ class FastTracker:
         ct = CamTrack(lm, f.reshape(-1, 2) if f is not None else np.zeros((0, 2), np.float32))
         if not self._advance(ct, slot, src, h[-1][1]):
             return False
+        if not self._agrees(ht, slot, ct, h[-1][0]):
+            return False
         ht.cams[slot] = ct
         self.stats["recovered_view"] += 1
         return True
+
+    def _agrees(self, ht, slot, ct, t):
+        """--flow-agree: a (re)seeded or rebuilt view in `slot` is accepted only if, together with the
+        other camera's current track, it triangulates consistently (median ray gap < MAX_GAP) AND lands
+        within agree_jump of the hand's current position (when that is fresh).  Otherwise the new view
+        would make the stereo position snap (the short in/out depth jumps)."""
+        if not self.agree:
+            return True
+        other = ht.cams.get(1 - slot)
+        if other is None:
+            return True
+        c = {slot: ct, 1 - slot: other}
+        o1, d1 = self.palm.rays(1, c[1].lm)
+        o0, d0 = self.palm.rays(0, c[0].lm)
+        P, gap, s1, s0 = triangulate(np.broadcast_to(o1, d1.shape), d1, np.broadcast_to(o0, d0.shape), d0)
+        ok = np.median(gap) < MAX_GAP and (s1 > 0.05).all() and (s0 > 0.05).all()
+        if ok and ht.last_pos is not None and t - ht.last_pos_t < 0.1:
+            ok = np.linalg.norm(P[CENTRE_ROWS].mean(0) - ht.last_pos) < self.agree_jump
+        if ok:
+            ht.agree_rejects = 0
+            return True
+        ht.agree_rejects = getattr(ht, "agree_rejects", 0) + 1
+        self.stats["agree_reject"] += 1
+        if ht.agree_rejects >= 3:
+            # repeated disagreement: the existing track is more likely the stale one; take the new
+            # detection and drop the other camera (it is rebuilt / re-seeded next)
+            ht.agree_rejects = 0
+            ht.cams.pop(1 - slot, None)
+            self.stats["agree_override"] += 1
+            return True
+        return False
 
     def drop_stale(self, t, max_age=1.0):
         for side in list(self.hands):
