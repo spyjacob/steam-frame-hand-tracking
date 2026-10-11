@@ -1,4 +1,20 @@
-# frame-handtrack — optical hand tracking for the Steam Frame
+# steam-frame-hand-tracking — optical hand tracking for the Steam Frame
+
+> [!WARNING]
+> **Work in progress — and it makes the headset run hot.**
+>
+> - Hand tracking runs on the Frame's CPU on top of Valve's own streaming and tracking work, which
+>   already keeps the CPU at roughly 70–85 °C. With tracking on, the hottest core regularly reaches
+>   the high 80s and has hit **93–95 °C**. The headset **rebooted once** under heavy load during
+>   development (the cause was not proven).
+> - A built-in watchdog stops hand tracking if any CPU sensor stays at **≥ 93 °C for 3 seconds**. It
+>   is a safety net, not a guarantee. Track **one hand** where you can (roughly half the work), and
+>   watch the temperature on the panel.
+> - Tracking is usable but laggy on fast wrist turns, can lose a hand, and may occasionally pick the
+>   wrong hand. Heavy load has also caused faint vertical banding in passthrough. See
+>   [REPORT.md](REPORT.md).
+> - This modifies how SteamVR runs on the headset (a user-level Vulkan layer in the compositor).
+>   Use at your own risk.
 
 Use your **bare hands** in PC VR games streamed to the Steam Frame. The Frame's own front
 passthrough cameras track your hands; the PC sees them as two Frame controllers (hand pose + finger
