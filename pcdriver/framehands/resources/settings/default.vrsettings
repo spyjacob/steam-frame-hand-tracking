@@ -1,0 +1,18 @@
+{
+	"driver_framehands": {
+		"enable": true,
+		"headsetHost": "192.168.8.180",
+		"port": 47811,
+		"stillSeconds": 2.0,
+		"forceHandMode": false,
+		"predict": true,
+		"predictRotation": true,
+		"velocitySmoothing": 0.5,
+		"maxPredictMs": 100,
+		"lostHoldMs": 250,
+		"handAwayCm": 15,
+		"maxVelocity": 3.0,
+		"maxAngularVelocity": 15.0,
+		"maxJumpCm": 15
+	}
+}

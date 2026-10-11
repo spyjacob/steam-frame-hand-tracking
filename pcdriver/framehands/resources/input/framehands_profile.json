@@ -1,0 +1,11 @@
+{
+	"jsonid": "input_profile",
+	"controller_type": "framehands",
+	"device_class": "TrackedDeviceClass_Controller",
+	"input_bindingui_mode": "controller_handed",
+	"should_show_binding_errors": false,
+	"input_source": {
+		"/input/system": { "type": "button", "click": true, "binding_image_point": [ 50, 50 ], "order": 1 },
+		"/pose/raw": { "type": "pose", "binding_image_point": [ 50, 50 ] }
+	}
+}

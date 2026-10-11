@@ -1,0 +1,24 @@
+# camera images, recordings, calibration copies and captures: local only (contain the user and their room)
+data/
+*.dataset/
+*.pgm
+*.ppm
+# models are fetched, not redistributed (Mercury model license unverified)
+*.onnx
+*.tflite
+*.task
+models/
+# environments and build outputs
+pc/venv/
+**/__pycache__/
+*.pyc
+backup/
+pcdriver/build/
+capture/build/
+*.obj
+*.exp
+*.lib
+*.pdb
+*.ilk
+# the installed driver binary is built locally (pcdriver/build.bat)
+pcdriver/framehands/bin/

@@ -1,0 +1,180 @@
+"""Continuous per-hand tracking with Monado Mercury's keypoint model (opt-in: --backend mercury).
+
+MediaPipe stays the DISCOVERY path (finds hands, initial 21-joint 3D).  Once a hand has a 3D
+joint state, this tracker re-observes it every cycle with one Mercury crop per hand (cameras
+alternate), using the hand's own previous joints as ROI and temporal hint.  A single view gives a
+full articulated 3D hand: Mercury predicts each joint's ray AND its depth relative to the middle
+knuckle in hand-size units; absolute depth is anchored to the 60 Hz stereo palm position from the
+optical-flow tracker when available, else to the previous state.  When the other camera's result
+for the same hand is fresh (< STEREO_MS), joints are triangulated instead.
+
+The Mercury model license is UNVERIFIED (local evaluation only).
+"""
+import numpy as np
+
+from handtrack.calib import triangulate
+from handtrack.palm import PALM_IDX, finger_curls
+
+STEREO_MS = 40.0          # other view's rays this fresh -> triangulate joints
+COLLAPSE_M = 0.07         # two tracked hands closer than this (palm centres) = one physical hand
+CURL_SCALE = (2.0, 4.0, 4.0, 4.0, 4.0)   # Mercury curl output (negative = flexed) -> 0..1, thumb first
+                                         # (provisional mapping, not calibrated against ground truth)
+LOST_AFTER_S = 0.35       # no accepted Mercury observation for this long -> back to discovery
+
+
+class HandState:
+    def __init__(self, side, P, t):
+        self.side = side
+        self.P = np.asarray(P, float)             # (21,3) head frame
+        self.t = t
+        self.hand_size = float(np.linalg.norm(self.P[0] - self.P[9]))
+        self.next_slot = 1
+        self.last_rays = {}                       # slot -> (t, origin, rays head frame)
+        self.misses = 0
+        self.created = t
+        self.curls_by_view = {}                   # slot -> (t, mercury curls (5,), variances (5,))
+
+
+class MercuryTracker:
+    def __init__(self, palm, pool, worker):
+        self.palm = palm                          # PalmTracker: pose[slot], _pose(), curl_filt
+        self.pool = pool                          # dedicated ProcessPoolExecutor(1)
+        self.worker = worker                      # module with run_mercury(jobs, imgs)
+        self.hands = {}                           # side -> HandState
+        self.job = None
+        self.curl_source = "mercury"
+        self.collapsed = None
+        self.stats = {"runs": 0, "accepted": 0, "rejected": 0, "stereo": 0, "mono": 0, "ms": []}
+
+    def tracked(self):
+        return set(self.hands)
+
+    @staticmethod
+    def palm_c(P):
+        return np.asarray(P)[[0, 5, 9, 17]].mean(0)
+
+    def seed(self, side, P, t):
+        """New 3D joints from MediaPipe discovery: start (or re-anchor) tracking this hand.
+        Never start a hand on top of the other tracked hand."""
+        if P is None:
+            return
+        other = self.hands.get("right" if side == "left" else "left")
+        if other is not None and np.linalg.norm(self.palm_c(P) - self.palm_c(other.P)) < COLLAPSE_M:
+            self.stats["seed_blocked"] = self.stats.get("seed_blocked", 0) + 1
+            return
+        hs = self.hands.get(side)
+        if hs is None or t - hs.t > LOST_AFTER_S:
+            self.hands[side] = HandState(side, P, t)
+
+    def busy(self):
+        return self.job is not None
+
+    def submit(self, imgs, t_cap_ns, fast_pos):
+        """One Mercury crop per tracked hand on this frame (alternating cameras)."""
+        if self.job is not None or not self.hands:
+            return False
+        jobs = []
+        for side, hs in self.hands.items():
+            P = hs.P
+            fp = fast_pos.get(side)
+            if fp is not None:                    # move the ROI with the 60 Hz palm position
+                P = P + (np.asarray(fp[0]) - P[PALM_IDX[:1] + [5, 9, 17]].mean(0))
+            slot = hs.next_slot
+            hs.next_slot = 1 - slot
+            R, t = self.palm.pose[slot]
+            jc = (P - t) @ R
+            if (jc[:, 2] < 0.08).any():          # behind / too close to this camera: try the other one
+                slot = 1 - slot
+                R, t = self.palm.pose[slot]
+                jc = (P - t) @ R
+                if (jc[:, 2] < 0.08).any():
+                    continue
+            jobs.append((slot, side, jc))
+        if not jobs:
+            return False
+        used = sorted({j[0] for j in jobs})
+        self.job = (self.pool.submit(self.worker.run_mercury, jobs, {s: imgs[s] for s in used}), t_cap_ns, fast_pos,
+                    {s: imgs[s] for s in used})
+        return True
+
+    def collect(self):
+        """If the in-flight job finished: update hand states.
+        Returns {side: (pose tuple, slot, det_px, t_capture_s, image_the_crop_came_from)}."""
+        if self.job is None or not self.job[0].done():
+            return {}
+        fut, t_ns, fast_pos, job_imgs = self.job
+        self.job = None
+        t = t_ns / 1e9
+        try:
+            res = fut.result()
+        except Exception:
+            return {}
+        out = {}
+        for slot, side, r, dsec in res:
+            self.stats["runs"] += 1
+            self.stats["ms"].append(dsec * 1e3)
+            hs = self.hands.get(side)
+            if hs is None:
+                continue
+            if r is None or r["is_hand"] < 0.97:
+                self.stats["rejected"] += 1
+                hs.misses += 1
+                continue
+            R, o = self.palm.pose[slot]
+            rays = r["rays"] @ R.T                       # head frame
+            hs.last_rays[slot] = (t, o, rays)
+            other = hs.last_rays.get(1 - slot)
+            P = None
+            if other is not None and (t - other[0]) * 1e3 < STEREO_MS:
+                (to, oo, ro) = other
+                Pm, gap, s1, s2 = triangulate(np.broadcast_to(o, rays.shape), rays, np.broadcast_to(oo, ro.shape), ro)
+                if np.median(gap) < 0.02 and (s1 > 0.05).all() and (s2 > 0.05).all():
+                    P = Pm
+                    hs.hand_size = 0.9 * hs.hand_size + 0.1 * float(np.linalg.norm(P[0] - P[9]))
+                    self.stats["stereo"] += 1
+            if P is None:
+                # single view: rays + Mercury's relative depths; absolute depth of the middle knuckle from
+                # the 60 Hz stereo palm position if fresh, else from the previous state
+                fp = fast_pos.get(side)
+                anchor = np.asarray(fp[0]) if fp is not None else hs.P[[0, 5, 9, 17]].mean(0)
+                prevc = hs.P[[0, 5, 9, 17]].mean(0)
+                d9 = np.linalg.norm(hs.P[9] + (anchor - prevc) - o)
+                dist = d9 + r["rel_depth"] * hs.hand_size
+                P = o + rays * dist[:, None]
+                # re-anchor so the palm centre sits on the stereo palm position
+                if fp is not None:
+                    P = P + (anchor - P[[0, 5, 9, 17]].mean(0))
+                self.stats["mono"] += 1
+            jump = np.linalg.norm(P[[0, 5, 9, 17]].mean(0) - hs.P[[0, 5, 9, 17]].mean(0))
+            if jump > 0.25 and t - hs.t < 0.2:         # implausible: keep the old state, count a miss
+                self.stats["rejected"] += 1
+                hs.misses += 1
+                continue
+            hs.P, hs.t, hs.misses = P, t, 0
+            self.stats["accepted"] += 1
+            hs.curls_by_view[slot] = (t, np.asarray(r["curls"], float), np.asarray(r["curl_var"], float))
+            if self.curl_source == "mercury":
+                # Mercury's own curl output (consistent across views): variance-weighted mean of fresh views
+                vs = [(c, v) for (tc, c, v) in hs.curls_by_view.values() if t - tc < 0.2]
+                wsum = sum(1 / v for _, v in vs)
+                mc = sum(c / v for c, v in vs) / wsum
+                raw_curls = np.clip(-mc / np.array(CURL_SCALE), 0, 1)
+            else:
+                raw_curls = finger_curls(P)
+            curls = self.palm.curl_filt[side](raw_curls, t)
+            pose = self.palm._pose(side, P, t, conf=r["is_hand"]) + (curls,)
+            out[side] = (pose, slot, r["det_px"], t, job_imgs[slot])
+        for side in list(self.hands):
+            if t - self.hands[side].t > LOST_AFTER_S:
+                del self.hands[side]
+        # collapse guard: both trackers on the same physical hand -> drop the newer track, re-discover
+        self.collapsed = None
+        if len(self.hands) == 2:
+            L, R = self.hands["left"], self.hands["right"]
+            if np.linalg.norm(self.palm_c(L.P) - self.palm_c(R.P)) < COLLAPSE_M:
+                drop = "left" if L.created > R.created else "right"
+                del self.hands[drop]
+                out.pop(drop, None)
+                self.collapsed = drop
+                self.stats["collapses"] = self.stats.get("collapses", 0) + 1
+        return out

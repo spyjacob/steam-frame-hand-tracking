@@ -1,0 +1,32 @@
+2026-10-10T21:46:47-07:00 camera/enableCamera false->true via IVRSettings (orig backup: backup/steamvr.vrsettings.orig)
+2026-10-10T21:50:58-07:00 rollback: camera/enableCamera -> false
+2026-10-10T21:50:58-07:00 driver debug: start_tracking_recording 1 1 1 (5s)
+2026-10-10T21:52:42-07:00 stop_tracking_recording
+2026-10-10T21:53:39-07:00 FIX: removed camera/enableCamera key (explicit false had disabled passthrough UI)
+2026-10-10T21:53:49-07:00 FIX: removed camera/enableCamera key (explicit false had disabled passthrough UI)
+2026-10-10T22:31:51-07:00 install: VK_LAYER_MRHAND manifest /home/steamos/.local/share/vulkan/implicit_layer.d/mrhand.json
+2026-10-10T22:31:56-07:00 SteamVR restart to load VK_LAYER_MRHAND
+2026-10-10T22:33:10-07:00 test: cycle camera/roomViewStyle (orig 4), restore after
+2026-10-10T22:42:06-07:00 SAFETY: SteamVR error-restart reported by user; disabled mrhand (removed enable-capture), stopped ptgrab/live
+2026-10-10T22:42:50-07:00 re-enabled mrhand (user: crash unrelated, continue)
+2026-10-10T22:54:33-07:00 stopped ptgrab/live (session paused); mrhand layer stays enabled
+2026-10-11T00:26:16-07:00 thermal policy: guard 80/84/87(resume 82) incl gpuss zones; separate watchdog stops workload at >=89C for 3s; start/stop manage watchdog
+2026-10-11T00:28:05-07:00 instrumentation: telemetry CSV (~/handtrack/data/telemetry.csv, rotated 20MB) + tools/telemetry_report.py
+2026-10-11T00:34:08-07:00 bridge: protocol v3 (capture-time tCapNs in hand packets; FhPing->FhPong clock sync), v2 still served to old driver
+2026-10-11T00:34:08-07:00 live.py: capture timestamps snapped to camera 60 Hz grid (ESTIMATE: ptgrab detection time, not exposure); MediaPipe in separate process (mpworker.py); camera-averaged MediaPipe orientation + adaptive rotation smoothing; orientation outlier gate (>50 deg needs confirmation); fast-orient OFF by default (measured p95 14-23 deg/frame noise)
+2026-10-11T00:34:08-07:00 PC driver v3 built (not installed): live ini config, HMD pose history, ping/pong clock, interp/extrap presentation, angular extrapolation OFF, linear capped 50 ms. Rollback binary: pcdriver\build\driver_framehands_WORKING_v2.dll
+2026-10-11T00:34:08-07:00 NOTE: earlier reboot cause UNVERIFIED (CPU trip points are 110 C; fan controller max 95 C on cpu7_middle)
+2026-10-11T00:46:21-07:00 driver live config -> C2 (predictLinear=0, interpDelayMs=17) after synthetic ablation ablation2: reversal overshoot 0% vs 24% (C0); still p99 0.54mm vs 3.9mm
+2026-10-11T00:49:30 WATCHDOG: cpu2-bottom-thermal at 92.3 C for 3 s -> stopping hand tracking
+2026-10-11T00:58:42-07:00 tracker restarted (lighter optical flow: 18 pts/hand, win15; fast path halves at >=84 C)
+2026-10-11T01:01:27-07:00 USER-SET thermal limits: guard 88/90/92 (resume 88), watchdog 93 C x3s, validate start<=88 stop>91
+2026-10-11T01:02:33-07:00 live: --mercury-shadow (Mercury keypoints on stereo MediaPipe frames, logged S/S3 telemetry rows, not driving hands)
+2026-10-11T01:05:28-07:00 live: rotation lag fixes - camera-average only if both <150 ms old (was 600), rot-smooth 40 ms (adaptive ~25-100 ms)
+2026-10-11T01:08:04-07:00 live: hand identity by 3D position (reassociate MediaPipe labels to nearest tracked hand; geometric seed selection)
+2026-10-11T01:08:52-07:00 live: --backend mercury available (MediaPipe discovery 2 Hz + Mercury keypoint tracking per hand); started with it
+2026-10-11T01:10:59-07:00 A/B: pipeline stopped to test passthrough banding report
+2026-10-11T01:19:29-07:00 tracker now SCHED_IDLE on cpus 0-2 (banding A/B: grabber alone clean, tracker caused banding); default args in ~/handtrack/start_args (--backend mercury)
+2026-10-11T01:21:02-07:00 installed Hand Tracking dashboard panel (app handtrack.toggle, autolaunch; remove: ~/handtrack/src/overlay/install_overlay.sh --remove)
+2026-10-11T01:32:57-07:00 mercury: collapse guard (7 cm), no duplicate seeds, discovery at normal rate while <2 hands tracked, geometric L/R sanity for new hands, Mercury curl output (provisional mapping), curl filter 1.0/1.0, cpus 0-4 SCHED_IDLE
+2026-10-11T03:59:23-07:00 per-hand control: panel LEFT/RIGHT toggles (~/.config/mrhand/hands), tracker skips disabled hands + sends enabled mask (v3 pad), PC driver loose set-down for enabled hands (new DLL)
+2026-10-11T04:03:00-07:00 one-hand mode: a lone detection labelled as the disabled hand but on the enabled hand's side of the head is taken as the enabled hand (MediaPipe single-view labels were dropping the left hand)
