@@ -4,7 +4,7 @@ MediaPipe (palm search + 21-point landmark network) costs ~20-50 ms per camera
 frame on the Frame's CPU, so it only runs ~5-10 times a second (heat).  Between
 runs, the six palm landmarks MediaPipe found (wrist, thumb CMC, four knuckles)
 are followed individually in both cameras with pyramidal Lucas-Kanade optical
-flow, helped by up to 30 textured points inside the hand outline.  Triangulating
+flow, helped by up to 12 textured points inside the hand outline.  Triangulating
 the six landmarks every frame gives the full palm frame (position + rotation)
 at 60 Hz with the same construction palm.py uses.
 
@@ -31,9 +31,13 @@ LK_WIN, LK_LEVELS = (15, 15), 3
 LK = dict(winSize=LK_WIN, maxLevel=LK_LEVELS,
           criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 15, 0.05))
 N_EXTRA = 12                        # textured points per hand besides the 6 landmarks (was 30)
+FEAT_MARGIN = 16                    # px of image around the hand outline used when picking texture points
 
-# (Sharing one pyramid per image across calls would save most of the remaining cost, but
-#  OpenCV's Python binding does not accept prebuilt pyramids; that needs a C++ tracker.)
+# Nearly all of an LK call's cost is building both images' pyramids and the first image's derivatives:
+# tracking 36 points costs about the same as tracking 1.  So all hands seen by a camera are tracked in
+# one call pair (step_tracks).  Sharing one pyramid per image across calls would save most of the rest,
+# but OpenCV's Python binding takes single images only (prebuilt pyramids are rejected, checked on
+# OpenCV 5.0); that needs a C++ tracker.
 MAX_SPEED = 4.0                     # m/s; faster apparent motion is a tracking error, not a hand
 MAX_GAP = 0.025                     # m, median ray gap of the triangulated landmarks
 
@@ -99,25 +103,71 @@ class CamTrack:
     def centre(self):
         return self.lm[CENTRE_ROWS].mean(0).astype(np.float64)
 
-    def step(self, prev, cur):
-        pts = np.vstack([self.lm, self.extra]).reshape(-1, 1, 2)
-        nxt, st, _ = cv2.calcOpticalFlowPyrLK(prev, cur, pts, None, **LK)
-        if nxt is None:
-            self.ok = False
-            return False
-        back, st2, _ = cv2.calcOpticalFlowPyrLK(cur, prev, nxt, None, **LK)   # forward-backward check
-        fb = np.linalg.norm((back - pts).reshape(-1, 2), axis=1)
-        good = (st.ravel() == 1) & (st2.ravel() == 1) & (fb < 2.5)
+    def points(self):
+        return np.vstack([self.lm, self.extra])
+
+    def update(self, old, new, good):
+        """Apply one flow result: old = points() before the step, new = their tracked positions."""
         if good.sum() < 4:
             self.ok = False
             return False
-        old, new = pts.reshape(-1, 2), nxt.reshape(-1, 2)
         shift = np.median(new[good] - old[good], axis=0)
         n = len(self.lm)
         # landmarks keep their identity: tracked if good, otherwise moved with the hand
         self.lm = np.where(good[:n, None], new[:n], old[:n] + shift).astype(np.float32)
         self.extra = new[n:][good[n:]].astype(np.float32)
         return True
+
+    def step(self, prev, cur):
+        return step_tracks([self], prev, cur)[0]
+
+
+def step_tracks(tracks, prev, cur):
+    """Follow CamTracks of one camera from image prev to cur, all their points in one forward and one
+    backward LK call.  LK tracks every point on its own, so each track gets exactly the result it would
+    get alone, for about the cost of one track (see the note at LK).  Returns each track's success."""
+    pts = [ct.points() for ct in tracks]
+    allp = np.vstack(pts).reshape(-1, 1, 2)
+    nxt, st, _ = cv2.calcOpticalFlowPyrLK(prev, cur, allp, None, **LK)
+    if nxt is None:
+        for ct in tracks:
+            ct.ok = False
+        return [False] * len(tracks)
+    back, st2, _ = cv2.calcOpticalFlowPyrLK(cur, prev, nxt, None, **LK)   # forward-backward check
+    fb = np.linalg.norm((back - allp).reshape(-1, 2), axis=1)
+    good = (st.ravel() == 1) & (st2.ravel() == 1) & (fb < 2.5)
+    new = nxt.reshape(-1, 2)
+    out, i = [], 0
+    for ct, p in zip(tracks, pts):
+        out.append(ct.update(p, new[i:i + len(p)], good[i:i + len(p)]))
+        i += len(p)
+    return out
+
+
+def texture_points(img, px):
+    """Up to N_EXTRA corners inside the convex hull of the landmarks px (N,2), as (M,2) float32.
+    Same points as goodFeaturesToTrack on the whole image with the hull as mask (several times the
+    cost): the search runs on the hull's bounding box plus FEAT_MARGIN, which is wider than the corner
+    filters reach, with x aligned to 16 px so each column gets the same SIMD arithmetic as in the whole
+    image.  tools/test_fasttrack.py checks the equality."""
+    hull = cv2.convexHull(px.astype(np.int32))
+    h, w = img.shape[:2]
+    lo, hi = hull.reshape(-1, 2).min(0), hull.reshape(-1, 2).max(0)
+    if (lo < -4096).any() or (hi > 4096).any():          # wild landmarks: plain whole-image search
+        x0, y0, x1, y1 = 0, 0, w, h
+    else:
+        x0 = max(0, (int(lo[0]) - FEAT_MARGIN) // 16 * 16)
+        y0 = max(0, int(lo[1]) - FEAT_MARGIN)
+        x1 = min(w, (int(hi[0]) + FEAT_MARGIN + 16) // 16 * 16)
+        y1 = min(h, int(hi[1]) + FEAT_MARGIN + 1)
+        if x1 <= x0 or y1 <= y0:                       # hand entirely outside the image
+            return np.zeros((0, 2), np.float32)
+    mask = np.zeros((y1 - y0, x1 - x0), np.uint8)
+    cv2.fillConvexPoly(mask, hull - np.array([x0, y0], np.int32), 255)
+    f = cv2.goodFeaturesToTrack(img[y0:y1, x0:x1], maxCorners=N_EXTRA, qualityLevel=0.01, minDistance=8, mask=mask)
+    if f is None:
+        return np.zeros((0, 2), np.float32)
+    return (f.reshape(-1, 2) + np.array([x0, y0], np.float32)).astype(np.float32)
 
 
 class HandTrack:
@@ -159,14 +209,13 @@ class FastTracker:
         """Re-seed from a MediaPipe result computed on det_img; carry the points forward
         to cur_img (the newest frame) with one optical-flow step.  pos3d: MediaPipe's
         head-frame palm centre, used only to start a track."""
+        # the points must refer to the frame the next step() starts from: cur_img, unless the caller
+        # skipped step() for this frame (heat), in which case the last frame it did process
+        cur_img = self.prev.get(slot, cur_img)
         lm = hand.px[LM_IDX].astype(np.float32)
         extra = np.zeros((0, 2), np.float32)
         if det_img is not None:
-            mask = np.zeros(det_img.shape[:2], np.uint8)
-            cv2.fillConvexPoly(mask, cv2.convexHull(hand.px.astype(np.int32)), 255)
-            f = cv2.goodFeaturesToTrack(det_img, maxCorners=N_EXTRA, qualityLevel=0.01, minDistance=8, mask=mask)
-            if f is not None:
-                extra = f.reshape(-1, 2).astype(np.float32)
+            extra = texture_points(det_img, hand.px)
         ct = CamTrack(lm, extra)
         if det_img is not None and cur_img is not None and det_img is not cur_img:
             if not self._advance(ct, slot, det_img, cur_img):
@@ -236,10 +285,7 @@ class FastTracker:
         if (px < 4).any() or (px > S - 5).any():
             return False
         lm = px[LM_IDX].astype(np.float32)
-        mask = np.zeros(src.shape[:2], np.uint8)
-        cv2.fillConvexPoly(mask, cv2.convexHull(px.astype(np.int32)), 255)
-        f = cv2.goodFeaturesToTrack(src, maxCorners=N_EXTRA, qualityLevel=0.01, minDistance=8, mask=mask)
-        ct = CamTrack(lm, f.reshape(-1, 2) if f is not None else np.zeros((0, 2), np.float32))
+        ct = CamTrack(lm, texture_points(src, px))
         if not self._advance(ct, slot, src, h[-1][1]):
             return False
         if not self._agrees(ht, slot, ct, h[-1][0]):
@@ -319,15 +365,22 @@ class FastTracker:
         return None, None
 
     def step(self, imgs, t):
-        self.info = {}            # side -> telemetry: position source, observation time, live point counts
         """imgs: {slot: gray det-frame image} for this capture instant.
         Returns {side: (head-frame palm centre (3,), quat wxyz or None)} for tracked hands."""
+        self.info = {}            # side -> telemetry: position source, observation time, live point counts
         out = {}
-        for side, ht in self.hands.items():
-            for slot, ct in list(ht.cams.items()):
-                if slot in imgs and slot in self.prev and not ct.step(self.prev[slot], imgs[slot]):
+        for slot, cur in imgs.items():
+            # every hand this camera sees, in one LK call pair
+            if slot not in self.prev:
+                continue
+            seen = [ht for ht in self.hands.values() if slot in ht.cams]
+            if not seen:
+                continue
+            for ht, ok in zip(seen, step_tracks([ht.cams[slot] for ht in seen], self.prev[slot], cur)):
+                if not ok:
                     del ht.cams[slot]
                     self.lost.add(slot)
+        for side, ht in self.hands.items():
             pos, q = self._raw(side, ht, t)
             # plausibility: near the face, and no faster than a real hand moves
             if pos is not None and ht.last_pos is not None and t - ht.last_pos_t < 0.5:

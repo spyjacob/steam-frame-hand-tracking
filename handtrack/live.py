@@ -724,14 +724,14 @@ def main():
                     shown[sl] = hs
                 with lock:
                     stats["det"] += [v[1] for v in res.values()]
-                if tel is not None:
-                    td_ns = time.monotonic_ns()
-                    for sl, (hs_, dsec) in res.items():
-                        tel.write("M,%d,%d,%s,%d,%.1f,%d" % (t_det, td_ns, kind, sl, dsec * 1e3, len(hs_)))
                     stats["frames"] += len(res)
                     stats["hands"] += nh
                     stats["palms"] += sum(p is not None for p in poses_d.values())
                     stats["monoerr"] += merr
+                if tel is not None:
+                    td_ns = time.monotonic_ns()
+                    for sl, (hs_, dsec) in res.items():
+                        tel.write("M,%d,%d,%s,%d,%.1f,%d" % (t_det, td_ns, kind, sl, dsec * 1e3, len(hs_)))
             fast.drop_stale(t_s, max_age=2.0)
 
             # ---- Mercury shadow comparison results

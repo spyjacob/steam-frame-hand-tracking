@@ -68,10 +68,12 @@ PC SteamVR driver "framehands" (C++ DLL) ── two virtual Frame controllers + 
 - Process: `nice 10`, affinity cores 0-6, OpenCV/BLAS single-threaded.
 - **Fast path, every camera frame (60 Hz)** — `handtrack/fasttrack.py`:
   - Images rotated upright (cam0 CW, cam1 CCW), 640×640 gray.
-  - Per hand, per camera: pyramidal Lucas-Kanade (21×21 window, 3 levels) on seed points =
-    6 palm landmarks (0,1,5,9,13,17) + up to 30 `goodFeaturesToTrack` corners inside the convex hull
-    of all 21 landmarks. Forward-backward check < 2.5 px, needs ≥4 good points. Palm-centre pixel
-    moves by the **median** point shift.
+  - Per camera, all tracked hands in one forward + one backward call (each call rebuilds both
+    images' pyramids, which is nearly all of its cost): pyramidal Lucas-Kanade (15×15 window,
+    3 levels) on each hand's seed points = 6 palm landmarks (0,1,5,9,13,17) + up to 12
+    `goodFeaturesToTrack` corners inside the convex hull of all 21 landmarks (searched on the hull's
+    bounding box only). Forward-backward check < 2.5 px, needs ≥4 good points per hand. Palm-centre
+    pixel moves by the **median** point shift.
   - 3D: triangulate the two cameras' palm-centre rays (accept gap < 3 cm); one camera only → keep
     the last distance along the new ray.
   - Plausibility gate: 10 cm–1 m from head, in front, ≤ 4 m/s apparent speed; failure → drop tracks,
