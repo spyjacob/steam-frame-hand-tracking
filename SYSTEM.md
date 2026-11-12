@@ -1,13 +1,14 @@
-# Steam Frame optical hand tracking — current system (2026-10-11)
+# Steam Frame optical hand tracking — v4 single-model tracker (branch v4-single-tracker, 2026-11-12)
 
 Goal: replace the Steam Frame controllers with optically tracked hands in any PC SteamVR app
 (streamed with Valve's native Frame streaming), Quest-3-like. Set a controller down → that hand
 switches to hand tracking; pick it up → back to the controller. No buttons from hands; pose +
 finger skeleton only.
 
-Current user verdict: works end to end (both hands, correct sides/orientation), but **too jittery**
-compared with Quest 3. Position is smooth-ish only when the fast tracker holds; orientation and
-fingers update slowly.
+v3 user verdict (main branch): accurate in the end, but laggy, jittery and losing the hand then
+snapping back. v4 replaces the three stitched trackers (optical flow + Mercury + MediaPipe, each
+feeding a different part of the pose through its own filter) with **one keypoint model and one
+filter per hand**. Everything still runs on the headset; the PC only receives poses.
 
 ---------------------------------------------------------------------------------------------------
 ## 1. Hardware / platform
@@ -39,8 +40,9 @@ XRService (Valve, untouched) ──dma-buf NV12 (UBWC compressed)──▶ vrcom
                        unix socket $XDG_RUNTIME_DIR/mrhand/cam.sock (same-uid only)
                                                                      ▼
 ptgrab (ours, C++/Vulkan, own low-priority GPU queue) ── /dev/shm/mrhand-pt (640x640 luma x2) ──▶
-handtrack.live (Python) ── fast optical-flow tracker 60 Hz + MediaPipe ≤10 Hz ── palm pose + curls
-     ── UDP FhHandPacket v2 (104→144 B, PC subscribes to headset:47811) ──▶
+handtrack.main (Python) ── Mercury keypoints ≤30/s per hand → palm fit → Kalman filter ── pose + curls
+     (Mercury detector + MediaPipe only while a hand is missing)
+     ── UDP FhHandPacket v3 (PC subscribes to headset:47811), every camera frame ──▶
 PC SteamVR driver "framehands" (C++ DLL) ── two virtual Frame controllers + 31-bone skeletons ──▶ apps
 ```
 
@@ -64,53 +66,76 @@ PC SteamVR driver "framehands" (C++ DLL) ── two virtual Frame controllers + 
 - Output: `/dev/shm/mrhand-pt` (header + 2 × 640² luma, per-camera seqlock, CLOCK_MONOTONIC
   "detected" timestamp). Runs `nice 10`, `taskset 0-6`.
 
-### 3.3 handtrack.live (`handtrack/live.py`) — main loop
-- Process: `nice 10`, affinity cores 0-6, OpenCV/BLAS single-threaded.
-- **Fast path, every camera frame (60 Hz)** — `handtrack/fasttrack.py`:
-  - Images rotated upright (cam0 CW, cam1 CCW), 640×640 gray.
-  - Per camera, all tracked hands in one forward + one backward call (each call rebuilds both
-    images' pyramids, which is nearly all of its cost): pyramidal Lucas-Kanade (15×15 window,
-    3 levels) on each hand's seed points = 6 palm landmarks (0,1,5,9,13,17) + up to 12
-    `goodFeaturesToTrack` corners inside the convex hull of all 21 landmarks (searched on the hull's
-    bounding box only). Forward-backward check < 2.5 px, needs ≥4 good points per hand. Palm-centre
-    pixel moves by the **median** point shift.
-  - 3D: triangulate the two cameras' palm-centre rays (accept gap < 3 cm); one camera only → keep
-    the last distance along the new ray.
-  - Plausibility gate: 10 cm–1 m from head, in front, ≤ 4 m/s apparent speed; failure → drop tracks,
-    request immediate MediaPipe re-detect, hold last good position ≤ 0.3 s.
-  - Output filtered with One Euro (min_cutoff 3.0, beta 0.8). Cost ~6-9 ms/frame with hands.
-- **Slow path (MediaPipe), background thread**:
-  - MediaPipe Tasks HandLandmarker (`hand_landmarker.task`, float16 full), VIDEO mode, num_hands=2,
-    CPU/XNNPACK, one detector instance per camera. Handedness labels used as-is (inverting them
-    swapped the hands).
-  - Schedule: ≤10 runs/s while a hand was seen in the last 1 s, 5/s idle; alternate cameras; every
-    6th run uses both cameras (stereo); a lost fast track triggers an immediate run on that camera.
-  - Thermal guard (max CPU zone): ≥86 °C → 15 Hz cap, ≥89 °C → 8 Hz, ≥92 °C pause until <86 °C.
-  - Measured cost per camera frame: ~22 ms (1 hand locked on), ~25 ms palm search alone,
-    **~42-50 ms** when num_hands=2 and only one hand is visible (palm search runs every frame).
-- Pose from a MediaPipe result (`handtrack/palm.py`):
-  - Stereo: triangulate all 21 landmarks; pair hands across cameras by palm ray gap (<2.5 cm);
-    gates: depth 0.10-1.30 m, wrist→middle-MCP 5-14 cm.
-  - Single camera: SQPnP fit of MediaPipe's metric world landmarks to the 2D points (rays from the
-    KB fisheye model) × per-hand scale learned on stereo frames (EMA; observed 1.03-1.16).
-    Mono-vs-stereo palm error observed p50 3.5-5.6 cm.
-  - Palm frame: centre = mean(wrist, idx MCP, mid MCP, pinky MCP); -z = wrist→mean(4 MCPs);
-    x from index→pinky (sign per hand); y = z×x (back of hand). One Euro on centre (1.5, 0.6) and axes.
-  - Finger curls from MediaPipe world landmarks: finger = (MCP+PIP+DIP flexion)/250°, thumb =
-    (MCP+IP)/140°, One Euro (2.0, 0.5). Splay not computed (sent as 0).
-- Composition sent at 60 Hz: **position = fast tracker; orientation + curls = latest MediaPipe
-  result (≤10 Hz, held between runs)**. MediaPipe position used only if the fast tracker has
-  nothing and it agrees with the last sent position within 10 cm.
-- Debug view: MJPEG on 127.0.0.1:8765 (SSH tunnel to the PC), both cameras, MediaPipe skeleton,
-  red circle = fast-tracked palm centre, palm xyz + curls. Logging: `~/handtrack/data/live_hands.jsonl`.
-- Measured now: fast path 60 fps, ~50 positions/s per hand, capture→send p50 ~15-23 ms;
-  MediaPipe ~5-10 runs/s; tracker CPU ~30 % idle (was 218 % before thread fixes).
+### 3.3 The v4 tracker (`handtrack/main.py`, `tracker.py`, `handfit.py`, `mercury.py`)
 
-### 3.4 Bridge protocol (`pcdriver/src/framehands_proto.h`, `handtrack/palm.py: Bridge`)
-- PC sends `FhSubscribe` {magic "FHND", version 2, kind 1} to headset UDP 47811 every second;
-  headset streams `FhHandPacket` to the sender (private LAN sources only; PC-initiated → no firewall rule).
-- Packet: magic, version, seq, mode, 2 × FhHand {valid, confidence, pos[3] head frame m,
-  quat[4] wxyz head-from-palm, ageMs (capture→send), curl[5], splay[5]}.
+One observation source, one state per hand:
+
+```
+every camera frame (60 Hz, both cameras paired by capture time, snapped to the 60 Hz grid)
+  1. collect finished keypoint crops → palm fit → Kalman update            (as soon as they finish,
+                                                                             also between frames)
+  2. each tracked hand that is due (≤ hz=30/s, shared budget=70 crops/s × thermal scale):
+     predict its pose to this frame → one 128×128 Mercury crop around the predicted joints in its
+     primary camera; both cameras of the same frame at track start and every 0.5 s / 3 s
+  3. an enabled hand missing → hand finders propose candidates: Mercury's 160×160 detector
+     (in-process, ≤30/s) and MediaPipe (own process, ≤12/s); idle rates (10/s, 4/s) once the
+     missing hands have been gone 2 s.  Each candidate is checked by the keypoint model in both
+     mirror images; the better heatmap decides left vs right; a checked candidate starts a track
+  4. send every enabled hand's pose, predicted to this frame's capture time
+```
+
+- **Keypoint model** (`mercury.py`, Monado Mercury `grayscale_keypoint_jan18.onnx`, port of Monado's
+  crop/decode): stereographic crop around the predicted joints (right hands mirrored: the model sees
+  left hands), temporal hint = predicted keypoints. Output per crop: 21 keypoint rays, relative depths,
+  is-hand probability, mean heatmap peak (`hm`), 5 finger curls. ~11 ms per crop on the Frame (one
+  ORT thread); two worker threads.
+- **Palm fit** (`handfit.fit_palm`): the rigid palm (wrist + 4 knuckles) of a canonical adult palm
+  scaled to the user, fitted to the keypoint rays of one or two views plus Mercury's relative depths
+  (Levenberg-Marquardt, analytic Jacobian, Huber weights, best 4 of 5 joints for the residual).
+  Starting points: the prediction, a closed form from the relative depths, and both planar-pose
+  (IPPE) solutions; the prediction picks between near-equal solutions. Gate: residual ≤ 4°,
+  plausible position. Covariance from JᵀJ (consistency checked in simulation: NEES ≈ 1–2.5).
+- **Palm size** (`PalmTemplate`): only the scale is learned — from stereo frames by fitting position,
+  rotation and scale together (`fit_scale`); a running median of 25 samples, moved ≤ 2 % per sample so
+  depth glides. (One frame's triangulation at 64 mm baseline is ±3 cm per knuckle: far too noisy to
+  learn a palm shape — doing that corrupted the template in testing.)
+- **Filter** (`PosKF`, `RotKF`): constant velocity for position and rotation (error-state on SO(3)).
+  Process noise follows the innovations, not the estimated speed (speed estimated from noisy
+  observations fed back into the gain and made a still hand shake): an observation more surprising
+  than its covariance allows is down-weighted the first time; a second surprise in the same direction,
+  a big position surprise, or the position opening, raises the process noise at once; otherwise it
+  decays to the floor (still hand: heavy smoothing; moving hand: open within 1–2 updates).
+  Outlier gate + restart where the hand really is (two agreeing outliers), output blended over 0.12 s.
+  A hand with no good observation glides to a stop (velocity decays after 50 ms), is held 0.25 s
+  (0.6 s when the other hand is in front of it), then reported missing.
+- **Two hands**: an observation is refused if the crop saw the other tracked hand (compared by palm
+  direction in the image and by position) or if its heatmap confidence dropped below 0.85 × the
+  hand's usual and it disagrees with the prediction (a mirrored hand = the wrong one). Two tracks
+  within 2 cm for 0.25 s are one hand (the newer is dropped; a clap's contact is shorter).
+- **Fingers**: Mercury's 5 curls from the same observation (provisional mapping thumb /2, fingers /4),
+  One Euro (1.5, 1.5).
+- **Output**: palm pose (same palm frame and quaternion as v3 — centre = mean(wrist, index, middle,
+  pinky knuckles); −z along the fingers; y = back of the hand), confidence by observation age, curls.
+- **Scheduling**: SCHED_IDLE on cores 0-4 by default (`start.sh`: `HANDTRACK_SCHED=other`,
+  `HANDTRACK_CPUS` to try others); thermal guard scales the crop budget and search rates (≥88 °C 0.7,
+  ≥90 °C 0.5, ≥92 °C 0.3 + no MediaPipe); the independent watchdog stops everything at ≥93 °C for 3 s.
+- **Parameters**: `handtrack/tracker.py` DEFAULTS; overridable with `--set key=value` or live in
+  `~/.config/mrhand/v4.conf` (`key = value` lines, re-read every second).
+- **Telemetry**: `~/handtrack/data/telemetry_v4.csv` (poses + tracker events, rotated at 20 MB; summary:
+  `tools/v4_report.py`);
+  status line every 5 s in `/tmp/live.log` (`[T C] fast: …`, read by the dashboard panel).
+- **Simulation**: `tools/sim_tracker.py` runs the real tracker in real time against synthetic hands
+  with known truth (oracle keypoint model decoded by the real decode path; occlusion; finders with
+  latency): still / reach / fast / slap / sudden stop / out-of-view / two hands crossing / clap / fingers.
+
+### 3.4 Bridge protocol (`pcdriver/src/framehands_proto.h`, `handtrack/bridge.py`)
+- PC sends `FhSubscribe` {magic "FHND", version 2 or 3, kind 1} to headset UDP 47811 every second
+  (v3 adds a clock ping, answered with `FhPong`); headset streams `FhHandPacket` to the sender
+  (private LAN sources only; PC-initiated → no firewall rule).
+- Packet: magic, version, seq, (v3: tCapNs = camera capture time, headset CLOCK_MONOTONIC), mode,
+  flags (v3: enabled hands), 2 × FhHand {valid, confidence, pos[3] head frame m, quat[4] wxyz
+  head-from-palm, ageMs (capture→send), curl[5], splay[5]}. v4 sends one packet per camera frame with
+  the pose predicted to that frame's capture time.
 
 ---------------------------------------------------------------------------------------------------
 ## 4. PC driver (`pcdriver/`, registered with `vrpathreg adddriver ...\pcdriver\framehands`)
@@ -140,21 +165,20 @@ PC SteamVR driver "framehands" (C++ DLL) ── two virtual Frame controllers + 
   maxPredictMs, lostHoldMs, handAwayCm, maxVelocity, maxAngularVelocity, maxJumpCm.
 
 ---------------------------------------------------------------------------------------------------
-## 5. Where the jitter / roughness comes from (current understanding)
+## 5. Why v3 felt laggy and jumpy, and what v4 changes
 
-1. **Orientation and fingers update at MediaPipe rate (≤10 Hz, often 5-8 under heat)** and are held
-   between runs → rotation steps; driver angular-velocity prediction from these sparse, noisy samples
-   adds overshoot.
-2. **Fast-tracker position noise**: median LK shift on a deforming, rotating hand; palm-centre pixel
-   in each camera drifts independently between MediaPipe re-seeds, then snaps on re-seed
-   (the re-seed is a hard reset, not a blend) → small jumps every MediaPipe run.
-3. **Single-camera depth** (PnP with MediaPipe's metric model) is 3-6 cm off; it is used to
-   initialise and whenever only one camera sees the hand.
-4. **Track losses on palm rotation** (appearance change) → hold/re-detect → visible hitches.
-5. **Two smoothing stages + prediction not designed together**: One Euro on the headset,
-   EMA velocity + SteamVR extrapolation on the PC, using the packet age (assumes headset and PC
-   clocks agree via age only; network jitter not modelled).
-6. **Heat ceiling**: MediaPipe is ~20-50 ms per frame on CPU; more runs → thermal throttling.
+| v3 (main) | v4 |
+|---|---|
+| position from optical flow, orientation + fingers from Mercury/MediaPipe, each with its own filter and timing | one keypoint observation updates position, orientation and fingers together |
+| re-seeds snapped the flow tracker to the slow path (jumps), flow lost on rotation (dropouts) | crops follow the filter's prediction; misses glide to a stop; re-acquisition blends |
+| stacked One Euro filters + glide (130–175 ms orientation lag for usable smoothness) | one Kalman filter per hand, adaptive to its own surprise; prediction to the capture time |
+| stereo triangulation of views from different times | stereo only from the same capture; single view uses the learned palm size |
+| MediaPipe on a schedule even when the hand is tracked | finders run only while a hand is missing |
+
+Remaining limits: a single view resolves the palm's tilt worst when it is edge-on (orientation error
+rises to 15–40° in the simulator's fastest wrist turns); motion blur during very fast moves can drop
+crops (the hand then glides and snaps back); Mercury's detector is unproven on Frame images, so
+MediaPipe remains the reliable finder.
 
 ## 6. Constraints / non-goals
 
@@ -166,8 +190,13 @@ PC SteamVR driver "framehands" (C++ DLL) ── two virtual Frame controllers + 
 
 ## 7. Operations
 
-- Headset: `~/handtrack/start.sh [live.py args]` / `~/handtrack/stop.sh`; logs /tmp/live.log,
-  /tmp/ptgrab.log, /tmp/mrhandcam-<pid>.log. Layer: `~/handtrack/src/capture/install.sh|uninstall.sh`.
+- Headset: `~/handtrack/start.sh [handtrack.main args]` / `~/handtrack/stop.sh` (the dashboard panel
+  runs them); default args in `~/handtrack/start_args_v4`; logs /tmp/live.log, /tmp/ptgrab.log,
+  /tmp/watchdog.log. Layer: `~/handtrack/src/capture/install.sh|uninstall.sh`.
+- Timing on the headset: `tools/bench_models.py`. Tracker in simulation: `tools/sim_tracker.py`.
+- Debug view: `HANDTRACK_HTTP=1 ~/handtrack/start.sh` (tracker not already running), then on the PC
+  `ssh -N -L 8765:127.0.0.1:8765 frame` → http://localhost:8765 (stream) or `/snap.jpg` (one frame).
+- First test of v4 on the headset: [docs/V4_TEST_PLAN.md](docs/V4_TEST_PLAN.md).
 - PC: build `pcdriver\build.bat`; DLL can only be replaced while PC SteamVR is closed.
   Remove: `vrpathreg removedriver <repo>\pcdriver\framehands`.
 - Change log: `~/handtrack/CHANGES.log`; investigation notes: `FINDINGS.md`.

@@ -1,0 +1,5 @@
+# Arguments for handtrack.main when started by start.sh / the dashboard panel (one or more per line).
+# Empty = defaults.  Examples:
+#   --set hz=25               fewer keypoint updates per hand (less heat)
+#   --no-mediapipe            find hands with Mercury's detector only
+# Tracker parameters can also be changed live in ~/.config/mrhand/v4.conf (see handtrack/tracker.py).

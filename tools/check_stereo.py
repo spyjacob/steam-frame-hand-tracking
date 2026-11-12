@@ -14,7 +14,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from handtrack.calib import Rig, triangulate  # noqa: E402
-from handtrack.live import PtShm  # noqa: E402
+from handtrack.headset import PtShm  # noqa: E402
 
 
 def main():

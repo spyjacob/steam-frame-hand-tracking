@@ -10,9 +10,10 @@
 > - A built-in watchdog stops hand tracking if any CPU sensor stays at **≥ 93 °C for 3 seconds**. It
 >   is a safety net, not a guarantee. Track **one hand** where you can (roughly half the work), and
 >   watch the temperature on the panel.
-> - Tracking is usable but laggy on fast wrist turns, can lose a hand, and may occasionally pick the
->   wrong hand. Heavy load has also caused faint vertical banding in passthrough. See
->   [REPORT.md](REPORT.md).
+> - **This branch (`v4-single-tracker`) is a new, not yet headset-tested tracker**: one keypoint model
+>   and one filter per hand instead of three stitched trackers. First test: [docs/V4_TEST_PLAN.md](docs/V4_TEST_PLAN.md).
+>   The previous tracker (laggy on fast wrist turns, could lose a hand) is on `main`. Heavy load has
+>   also caused faint vertical banding in passthrough. See [REPORT.md](REPORT.md).
 > - This modifies how SteamVR runs on the headset (a user-level Vulkan layer in the compositor).
 >   Use at your own risk.
 
@@ -24,7 +25,8 @@ back on the controller.**
 - Runs on the Frame itself; camera images never leave the headset, only hand poses (~150 bytes,
   60 times a second) go to the PC.
 - Works with Valve's normal Frame streaming. Any app with Frame-controller bindings works.
-- Status, measurements and limitations: **[REPORT.md](REPORT.md)**; latest latency work: [LATENCY_REPORT_V2.md](LATENCY_REPORT_V2.md); next research: [RESEARCH_BRIEF_V3.md](RESEARCH_BRIEF_V3.md).
+- How the v4 tracker works: **[SYSTEM.md](SYSTEM.md)**; measurements of the previous tracker: [REPORT.md](REPORT.md),
+  [LATENCY_REPORT_V2.md](LATENCY_REPORT_V2.md).
 
 ## The panel
 
@@ -61,21 +63,28 @@ How loose the set-down / pick-up rules are is in `pcdriver/framehands/framehands
 | `handAwayCm` | 10 cm | your tracked palm must be at least this far from the controller (a controller held still in your hand never switches) |
 | `pickupCm`, `pickupDeg` | 4 cm, 15° | moving the controller this much returns to the controller |
 
-### Smoothing
+### Tuning
 
-The wrist/finger smoothing can be changed live with `~/.config/mrhand/profile` (no restart; delete the
-file to return to the default). The default favours smooth slow movement with less lag than before.
-For the previous, smoothest setting: `cp ~/handtrack/src/tools/profile_smooth_v1.conf ~/.config/mrhand/profile`.
-Keys and measurements: [LATENCY_REPORT_V2.md](LATENCY_REPORT_V2.md).
+Tracker parameters (`handtrack/tracker.py`, `DEFAULTS`) can be changed live in
+`~/.config/mrhand/v4.conf`, one `key = value` per line (no restart; delete the file to return to the
+defaults). The ones that matter most:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `sa_lo`, `ra_lo` | 0.3, 3.0 | smoothing of a still hand (position m/s², rotation rad/s²): lower = steadier, slower to start moving |
+| `attack` | 9 | how surprising an observation must be to open the filter (lower = snappier, more jitter) |
+| `hz` | 30 | keypoint updates per second per hand (heat) |
+| `budget` | 70 | keypoint crops per second for everything (heat) |
+| `hold_s` | 0.25 | how long a lost hand stays before it is reported missing |
 
 ## Troubleshooting
 
 | Symptom | Cause / fix |
 |---|---|
-| Set the controller down, nothing happens | Is that hand **ON** in the panel? Is your hand in front of you (the cameras see roughly what passthrough shows)? Check `/tmp/live.log`: `hands/run 0.00` means no hand detected. |
+| Set the controller down, nothing happens | Is that hand **ON** in the panel? Is your hand in front of you (the cameras see roughly what passthrough shows)? Check `/tmp/live.log`: `tracked: -` and `acquired 0` means no hand found. |
 | Hand tracking stopped by itself, panel shows STOPPED | Thermal watchdog (≥ 93 °C for 3 s). Let it cool, use one hand, tap to restart. Log: `/tmp/watchdog.log`. |
 | Panel says on, PC shows nothing | PC driver not installed / SteamVR not restarted, or wrong `headsetHost` in the ini. The PC SteamVR log (`vrserver.txt`) shows `framehands stats: … packets/s`. |
-| Hands wobble / lag on fast turns | Known: see REPORT.md (finger and wrist updates are ~13/s per hand). |
+| Hands wobble / lag | `/tmp/live.log` status line: `crops …/s` and `accepted` (updates), `step mm p50/p95` (frame-to-frame movement: with a still hand that is the jitter), `missed`. Tune in `~/.config/mrhand/v4.conf`. |
 
 ---
 
@@ -84,12 +93,12 @@ Keys and measurements: [LATENCY_REPORT_V2.md](LATENCY_REPORT_V2.md).
 ### Headset (in `~/handtrack`, source in `~/handtrack/src` = this repo)
 
 ```
-# Python venv with mediapipe, opencv-python, numpy, onnxruntime in ~/handtrack/venv
+# Python venv with onnxruntime, opencv-python, numpy (tracking) and mediapipe (finding hands) in ~/handtrack/venv
 tools/fetch_models.sh                                  # models are downloaded, not in the repo
 capture/build.sh && capture/install.sh                 # build camera-sharing Vulkan layer + ptgrab, install the layer
 touch ~/.config/mrhand/enable-capture
 systemctl --user restart steamvr                       # compositor loads the layer
-cp headset/*.sh headset/start_args ~/handtrack/        # start.sh / stop.sh
+cp headset/*.sh headset/start_args_v4 ~/handtrack/     # start.sh / stop.sh / default args
 overlay/install_overlay.sh                             # the Hand Tracking dashboard panel
 ```
 
@@ -116,8 +125,8 @@ SteamVR. The driver DLL can only be replaced while PC SteamVR is closed.
 
 ```
 Frame:  passthrough cameras ─▶ vrcompositor ─(our passive Vulkan layer shares the camera buffers)─▶
-        ptgrab (GPU downscale, 640² × 2) ─▶ tracker (optical flow 60 Hz + MediaPipe discovery +
-        Mercury keypoints) ─▶ UDP hand packets
+        ptgrab (GPU downscale, 640² × 2) ─▶ tracker (Mercury keypoints on each hand ≤30/s → palm fit →
+        Kalman filter; hand finders only while a hand is missing) ─▶ UDP hand packets every frame
 PC:     framehands SteamVR driver ─▶ two virtual Frame controllers (pose + 31-bone skeleton) ─▶ game
 ```
 
@@ -132,11 +141,11 @@ PC:     framehands SteamVR driver ─▶ two virtual Frame controllers (pose + 3
 | Path | Runs on | What |
 |---|---|---|
 | `capture/` | Frame | `handcam_layer.cpp`: passive Vulkan layer in vrcompositor that shares the camera buffers (opt-in flag + crash guard). `ptgrab.cpp`: reads them on its own GPU queue, downscales, publishes `/dev/shm/mrhand-pt` |
-| `handtrack/` | Frame | the tracker: `live.py` main loop, `fasttrack.py` optical flow, `merctrack.py`/`mercury_kp.py` Mercury keypoints, `detect.py`/`mpworker.py` MediaPipe, `palm.py` pose + UDP bridge, `watchdog.py` |
-| `headset/` | Frame | `start.sh`, `stop.sh`, `rollback.sh`, `start_args` |
+| `handtrack/` | Frame | the tracker: `main.py` main loop, `tracker.py` tracking/acquisition, `handfit.py` palm fit + filters, `mercury.py` Mercury models, `detect.py`/`mpworker.py` MediaPipe finder, `bridge.py` UDP bridge, `headset.py` frames/thermal/telemetry, `watchdog.py` |
+| `headset/` | Frame | `start.sh`, `stop.sh`, `rollback.sh`, `start_args_v4` |
 | `overlay/` | Frame | the Hand Tracking dashboard panel |
 | `pcdriver/` | PC | SteamVR driver `framehands` (+ Valve's hand-simulation sample, BSD-3, in `third_party/`), live ini, pose recorder |
-| `tools/` | both | telemetry report, replay/ablation harness, validation tests, model fetch |
+| `tools/` | both | `sim_tracker.py` closed-loop simulation, `bench_models.py` timing, `v4_report.py` telemetry summary, driver replay/ablation harness, stereo check, model fetch |
 | `probe/` | Frame | early camera-API probes |
 
 Not in the repo: camera images, recordings and calibration copies (`data/`, they show the room),
